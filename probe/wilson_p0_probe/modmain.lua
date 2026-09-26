@@ -530,8 +530,28 @@ AddPlayerPostInit(function(inst)
             .. " remaining=" .. G.tostring(move.distance_to_goal))
     end
 
+    local function StartPickPreview(pick, target)
+        if inst:GetDistanceSqToInst(target) <= 4 then
+            return
+        end
+        local px, _, pz = inst.Transform:GetWorldPosition()
+        local tx, _, tz = target.Transform:GetWorldPosition()
+        local dx, dz = px - tx, pz - tz
+        local length = G.math.sqrt(dx * dx + dz * dz)
+        if length > 0.01 then
+            pick.preview_id = pick.id
+            SendClientMove("move_start", pick.epoch, pick.preview_id,
+                tx + dx / length, tz + dz / length)
+        end
+    end
+
     local function SetPickStatus(pick, status)
         if active_pick == pick then
+            if status ~= "started" and status ~= "received"
+                and pick.preview_id ~= nil then
+                SendClientMove("move_stop", pick.epoch, pick.preview_id)
+                pick.preview_id = nil
+            end
             pick.status = status
             command_ack = {epoch = pick.epoch, id = pick.id, status = status}
             G.print("[Wilson P0] pick id=" .. pick.id .. " target=" .. pick.target_guid
@@ -805,6 +825,7 @@ AddPlayerPostInit(function(inst)
             SetPickStatus(pick, "failed")
             return
         end
+        StartPickPreview(pick, target)
         inst:DoTaskInTime(auto_pick and 10 or 6, function()
             if inst:IsValid() and active_pick == pick and pick.status == "started" then
                 if inst:GetBufferedAction() == action then
@@ -871,6 +892,7 @@ AddPlayerPostInit(function(inst)
             SetPickStatus(pickup, "failed")
             return
         end
+        StartPickPreview(pickup, target)
         inst:DoTaskInTime(10, function()
             if inst:IsValid() and active_pick == pickup and pickup.status == "started" then
                 if inst:GetBufferedAction() == action then
@@ -883,7 +905,7 @@ AddPlayerPostInit(function(inst)
         end)
     end
 
-    local function StartChop(command)
+    local function StartFellTree(command)
         if (active_pick ~= nil and active_pick.status == "started")
             or (active_move ~= nil and active_move.status == "started")
             or (active_utility ~= nil and active_utility.status == "started") then
@@ -893,7 +915,7 @@ AddPlayerPostInit(function(inst)
         local chop = {
             epoch = command.epoch,
             id = command.id,
-            type = "CHOP_TARGET",
+            type = "FELL_TREE",
             target_guid = command.target_guid,
             status = "received",
         }
@@ -911,43 +933,86 @@ AddPlayerPostInit(function(inst)
             or workable:GetWorkAction() ~= G.ACTIONS.CHOP
             or hand == nil or hand.prefab ~= "axe"
             or not G.CanEntitySeeTarget(inst, target)
-            or inst:GetDistanceSqToInst(target) > 4
+            or inst:GetDistanceSqToInst(target) > 64
             or locomotor == nil or HasVisibleThreat(inst, SENSE_RADIUS) then
             SetPickStatus(chop, "rejected_target")
             return
         end
-        local before = workable:GetWorkLeft()
-        local action = G.BufferedAction(inst, target, G.ACTIONS.CHOP)
-        chop.action = action
-        action:AddSuccessAction(function()
-            local after_workable = target:IsValid() and target.components.workable or nil
-            local after = after_workable ~= nil
-                and after_workable:GetWorkAction() == G.ACTIONS.CHOP
-                and after_workable:GetWorkLeft() or 0
-            chop.work_delta = before - after
-            chop.tree_felled = after == 0
-            SetPickStatus(chop, after < before and "completed" or "uncertain")
-        end)
-        action:AddFailAction(function()
-            if chop.status == "started" then
-                SetPickStatus(chop, "failed_or_interrupted")
+        local initial_work = workable:GetWorkLeft()
+        local push_next_chop
+        push_next_chop = function()
+            if active_pick ~= chop or chop.status ~= "started" then
+                return
             end
-        end)
-        SetPickStatus(chop, "started")
-        SayIntent(command, "我砍几下这棵树")
-        local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
-        if not ok then
-            SetPickStatus(chop, "failed")
-            return
+            if HasVisibleThreat(inst, SENSE_RADIUS) then
+                SetPickStatus(chop, "interrupted_threat")
+                return
+            end
+            if G.TheWorld.state.phase ~= "day" then
+                SetPickStatus(chop, "interrupted_light")
+                return
+            end
+            local current = target:IsValid() and target.components.workable or nil
+            if current == nil or not current:CanBeWorked()
+                or current:GetWorkAction() ~= G.ACTIONS.CHOP then
+                chop.tree_felled = chop.work_delta ~= nil and chop.work_delta > 0
+                SetPickStatus(chop, chop.tree_felled and "completed" or "blocked_target")
+                return
+            end
+            local equipped = inventory:GetEquippedItem(G.EQUIPSLOTS.HANDS)
+            if equipped == nil or equipped.prefab ~= "axe" then
+                SetPickStatus(chop, "blocked_tool")
+                return
+            end
+            if not G.CanEntitySeeTarget(inst, target)
+                or inst:GetDistanceSqToInst(target) > 100 then
+                SetPickStatus(chop, "blocked_target")
+                return
+            end
+            local before = current:GetWorkLeft()
+            local action = G.BufferedAction(inst, target, G.ACTIONS.CHOP)
+            chop.action = action
+            action:AddSuccessAction(function()
+                if active_pick ~= chop or chop.status ~= "started" then
+                    return
+                end
+                local after_workable = target:IsValid() and target.components.workable or nil
+                local after = after_workable ~= nil
+                    and after_workable:GetWorkAction() == G.ACTIONS.CHOP
+                    and after_workable:GetWorkLeft() or 0
+                chop.work_delta = initial_work - after
+                if after <= 0 then
+                    chop.tree_felled = true
+                    SetPickStatus(chop, "completed")
+                elseif after < before then
+                    inst:DoTaskInTime(0, push_next_chop)
+                else
+                    SetPickStatus(chop, "uncertain")
+                end
+            end)
+            action:AddFailAction(function()
+                if chop.status == "started" then
+                    SetPickStatus(chop, "failed_or_interrupted")
+                end
+            end)
+            local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
+            if not ok then
+                SetPickStatus(chop, "failed")
+            elseif chop.preview_id == nil and chop.work_delta == nil then
+                StartPickPreview(chop, target)
+            end
         end
-        inst:DoTaskInTime(10, function()
+        SetPickStatus(chop, "started")
+        SayIntent(command, "我来砍倒这棵树")
+        push_next_chop()
+        inst:DoTaskInTime(30, function()
             if inst:IsValid() and active_pick == chop and chop.status == "started" then
-                if inst:GetBufferedAction() == action then
+                if inst:GetBufferedAction() == chop.action then
                     inst:ClearBufferedAction()
                     locomotor:Clear()
                     locomotor:Stop()
                 end
-                SetPickStatus(chop, "timed_out_or_interrupted")
+                SetPickStatus(chop, "timed_out")
             end
         end)
     end
@@ -964,6 +1029,15 @@ AddPlayerPostInit(function(inst)
         local replace_now = G.TheWorld.state.phase == "night"
             and hand ~= nil and hand.prefab == "torch"
             and TorchSeconds(hand, true) <= 3
+        if active_pick ~= nil and active_pick.status == "started"
+            and active_pick.preview_id ~= nil then
+            local target = G.Ents[active_pick.target_guid]
+            if target == nil or not target:IsValid()
+                or inst:GetDistanceSqToInst(target) <= 4 then
+                SendClientMove("move_stop", active_pick.epoch, active_pick.preview_id)
+                active_pick.preview_id = nil
+            end
+        end
         if survival_seen and (night_soon or dark_now or replace_now) and inventory ~= nil
             and not inst:HasTag("playerghost")
             and (last_local_light_at == nil or G.GetTime() - last_local_light_at >= 3) then
@@ -977,10 +1051,13 @@ AddPlayerPostInit(function(inst)
                     and locomotor.dest == active_move.owned_dest then
                     FinishMove(active_move, "interrupted_light")
                 elseif not replace_now and active_pick ~= nil and active_pick.status == "started"
-                    and locomotor ~= nil and inst:GetBufferedAction() == active_pick.action then
-                    inst:ClearBufferedAction()
-                    locomotor:Clear()
-                    locomotor:Stop()
+                    and locomotor ~= nil and (inst:GetBufferedAction() == active_pick.action
+                        or active_pick.type == "FELL_TREE") then
+                    if inst:GetBufferedAction() == active_pick.action then
+                        inst:ClearBufferedAction()
+                        locomotor:Clear()
+                        locomotor:Stop()
+                    end
                     SetPickStatus(active_pick, "interrupted_light")
                 elseif not replace_now and active_utility ~= nil and active_utility.status == "started"
                     and locomotor ~= nil and inst:GetBufferedAction() == active_utility.action then
@@ -1005,10 +1082,13 @@ AddPlayerPostInit(function(inst)
                 FinishMove(active_move, "interrupted_threat")
                 SayIntent({}, "附近有危险，我先停下")
             elseif active_pick ~= nil and active_pick.status == "started"
-                and inst:GetBufferedAction() == active_pick.action then
-                inst:ClearBufferedAction()
-                locomotor:Clear()
-                locomotor:Stop()
+                and (inst:GetBufferedAction() == active_pick.action
+                    or active_pick.type == "FELL_TREE") then
+                if inst:GetBufferedAction() == active_pick.action then
+                    inst:ClearBufferedAction()
+                    locomotor:Clear()
+                    locomotor:Stop()
+                end
                 SetPickStatus(active_pick, "interrupted_threat")
                 SayIntent({}, "附近有危险，我先停下")
             elseif active_utility ~= nil and active_utility.status == "started"
@@ -1121,7 +1201,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.18.0",
+            mod_version = "0.19.0",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,
@@ -1339,13 +1419,13 @@ AddPlayerPostInit(function(inst)
                     and key ~= last_command_key then
                     last_command_key = key
                     StartPickup(command)
-                elseif command.type == "CHOP_TARGET" and command.guid == inst.GUID
+                elseif command.type == "FELL_TREE" and command.guid == inst.GUID
                     and G.type(command.epoch) == "string" and G.type(command.id) == "number"
                     and G.type(command.target_guid) == "number"
                     and G.type(command.target_prefab) == "string"
                     and key ~= last_command_key then
                     last_command_key = key
-                    StartChop(command)
+                    StartFellTree(command)
                 elseif (command.type == "EAT_BERRIES"
                     or command.type == "EAT_FOOD"
                     or command.type == "CRAFT_TORCH"
@@ -1391,6 +1471,9 @@ AddPlayerPostInit(function(inst)
                             inst:ClearBufferedAction()
                             locomotor:Clear()
                             locomotor:Stop()
+                            status = "stopped_pick"
+                        elseif active_pick.type == "FELL_TREE" then
+                            SetPickStatus(active_pick, "stopped")
                             status = "stopped_pick"
                         else
                             SetPickStatus(active_pick, "failed_or_interrupted")

@@ -25,24 +25,20 @@ def observation(**changes):
 
 
 class SurvivalPlannerTests(unittest.TestCase):
-    def test_move_then_pick_waits_for_real_completion(self):
+    def test_approach_and_pick_waits_for_real_completion(self):
         planner = SurvivalPlanner()
         grass = {"guid": 99, "prefab": "grass", "ready": True, "dx": 5, "dz": 0}
         planner.start(observation(local_entities=[grass]))
         choice = planner.on_observation(observation(local_entities=[grass]), "epoch")
-        self.assertEqual(choice["type"], "MOVE_TO_TARGET")
+        self.assertEqual(choice["type"], "PICK_TARGET")
         planner.record_command(1, choice)
         self.assertIsNone(planner.on_observation(observation(
-            local_entities=[grass], movement={"epoch": "epoch", "id": 1, "status": "started"}), "epoch"))
-        nearby = {**grass, "dx": 1}
-        choice = planner.on_observation(observation(
-            local_entities=[nearby], movement={"epoch": "epoch", "id": 1, "status": "arrived"}), "epoch")
-        self.assertEqual(choice["type"], "PICK_TARGET")
-        planner.record_command(2, choice)
+            local_entities=[grass], execution={"epoch": "epoch", "id": 1,
+                                               "status": "started"}), "epoch"))
         choice = planner.on_observation(observation(
             inventory={"counts": {"cutgrass": 1, "twigs": 0, "berries": 0, "torch": 0}},
-            execution={"epoch": "epoch", "id": 2, "status": "completed", "inventory_delta": 1}), "epoch")
-        self.assertEqual(planner.completed, 2)
+            execution={"epoch": "epoch", "id": 1, "status": "completed", "inventory_delta": 1}), "epoch")
+        self.assertEqual(planner.completed, 1)
         self.assertEqual(choice["type"], "MOVE_TO_POINT")
 
     def test_craft_eat_and_equip_from_inventory_state(self):
@@ -179,7 +175,7 @@ class SurvivalPlannerTests(unittest.TestCase):
         ])
         planner.start(state)
         choice = planner.on_observation(state, "epoch")
-        self.assertEqual(choice["type"], "MOVE_TO_TARGET")
+        self.assertEqual(choice["type"], "PICK_TARGET")
         self.assertEqual(choice["target_prefab"], "grass")
 
     def test_picks_morsel_but_does_not_treat_it_as_ready_food(self):
@@ -210,7 +206,7 @@ class SurvivalPlannerTests(unittest.TestCase):
             local_entities=[{"guid": 79, "prefab": "flint", "ready": True,
                              "dx": 5, "dz": 0}])
         planner.start(state)
-        self.assertEqual(planner.on_observation(state, "epoch")["type"], "MOVE_TO_TARGET")
+        self.assertEqual(planner.on_observation(state, "epoch")["type"], "PICKUP_TARGET")
         full = observation(inventory={"counts": {**state["inventory"]["counts"], "flint": 6}},
                            local_entities=state["local_entities"])
         self.assertEqual(planner.on_observation(full, "epoch")["type"], "MOVE_TO_POINT")
@@ -227,14 +223,14 @@ class SurvivalPlannerTests(unittest.TestCase):
         self.assertEqual(choice["type"], "PICK_TARGET")
         self.assertEqual(choice["goal"], "food")
 
-    def test_harvest_target_two_units_away_is_approached_first(self):
+    def test_harvest_target_two_units_away_uses_one_action(self):
         planner = SurvivalPlanner()
         state = observation(local_entities=[
             {"guid": 95, "prefab": "berrybush", "ready": True,
              "dx": 2, "dz": 0}])
         planner.start(state)
         choice = planner.on_observation(state, "epoch")
-        self.assertEqual(choice["type"], "MOVE_TO_TARGET")
+        self.assertEqual(choice["type"], "PICK_TARGET")
         self.assertEqual(choice["target_prefab"], "berrybush")
 
     def test_prepares_second_torch_before_night(self):
@@ -361,7 +357,7 @@ class SurvivalPlannerTests(unittest.TestCase):
         inventory = {"counts": supplies, "hand": None,
                      "torch_ready_seconds": 150, "food_ready_hunger": 75}
         tree = {"guid": 83, "prefab": "evergreen", "ready": True,
-                "dx": 1, "dz": 0}
+                "dx": 5, "dz": 0}
         ready = observation(cycles=1, seconds_until_night=60,
                             vitals={"health": {"current": 150},
                                     "hunger": {"current": 120},
@@ -381,19 +377,18 @@ class SurvivalPlannerTests(unittest.TestCase):
             local_entities=[tree],
             utility={"epoch": "epoch", "id": 1, "status": "completed"})
         choice = planner.on_observation(with_axe, "epoch")
-        self.assertEqual(choice["type"], "CHOP_TARGET")
+        self.assertEqual(choice["type"], "FELL_TREE")
+        self.assertTrue(choice["behavior_id"].startswith("tree-"))
         planner.record_command(2, choice)
-        first_chop = observation(**{**with_axe,
+        midway = observation(**{**with_axe,
             "execution": {"epoch": "epoch", "id": 2,
-                          "status": "completed", "work_delta": 1}})
-        choice = planner.on_observation(first_chop, "epoch")
-        self.assertEqual(choice["type"], "CHOP_TARGET")
-        planner.record_command(3, choice)
+                          "status": "started", "work_delta": 1}})
+        self.assertIsNone(planner.on_observation(midway, "epoch"))
         log = {"guid": 84, "prefab": "log", "ready": True,
                "dx": 1, "dz": 0}
         felled = observation(**{**with_axe, "local_entities": [log],
-            "execution": {"epoch": "epoch", "id": 3,
-                          "status": "completed", "work_delta": 1,
+            "execution": {"epoch": "epoch", "id": 2,
+                          "status": "completed", "work_delta": 3,
                           "tree_felled": True}})
         self.assertEqual(planner.on_observation(felled, "epoch")["type"], "PICKUP_TARGET")
 
@@ -505,8 +500,60 @@ class SurvivalPlannerTests(unittest.TestCase):
                     inventory={"counts": {}, "free_slots": 12, "hand": None})
                 planner.start(state)
                 choice = planner.on_observation(state, "epoch")
-                self.assertEqual(choice["type"], "MOVE_TO_TARGET")
+                self.assertEqual(choice["type"], "PICKUP_TARGET")
                 self.assertEqual(choice["target_prefab"], prefab)
+
+    def test_loot_cluster_keeps_behavior_until_nearby_items_are_handled(self):
+        planner = SurvivalPlanner()
+        supplies = {"cutgrass": 8, "twigs": 8, "torch": 2}
+        first = {"guid": 101, "prefab": "cutstone", "kind": "pickup",
+                 "ready": True, "dx": 1, "dz": 0}
+        second = {"guid": 102, "prefab": "cutstone", "kind": "pickup",
+                  "ready": True, "dx": 2, "dz": 0}
+        tool = {"guid": 103, "prefab": "pickaxe", "kind": "pickup",
+                "ready": True, "dx": 3, "dz": 0}
+        inventory = {"counts": supplies, "free_slots": 10,
+                     "torch_ready_seconds": 150, "food_ready_hunger": 75}
+        before = observation(local_entities=[first, second, tool], inventory=inventory)
+        planner.start(before)
+        choice = planner.on_observation(before, "epoch")
+        self.assertEqual(choice["type"], "PICKUP_TARGET")
+        behavior_id = choice["behavior_id"]
+        planner.record_command(1, choice)
+        after = observation(local_entities=[second, tool],
+                            inventory={**inventory, "counts": {**supplies,
+                                       "cutstone": 1}, "free_slots": 9},
+                            execution={"epoch": "epoch", "id": 1,
+                                       "status": "completed", "inventory_delta": 1})
+        choice = planner.on_observation(after, "epoch")
+        self.assertEqual(choice["type"], "PICKUP_TARGET")
+        self.assertEqual(choice["behavior_id"], behavior_id)
+        self.assertIn(choice["target_guid"], (102, 103))
+        self.assertTrue(any("chosen=" in event and "top=[" in event
+                            for event in planner.events))
+
+    def test_distant_loot_cluster_keeps_behavior_during_approach(self):
+        planner = SurvivalPlanner()
+        supplies = {"cutgrass": 8, "twigs": 8, "torch": 2}
+        inventory = {"counts": supplies, "free_slots": 10,
+                     "torch_ready_seconds": 150, "food_ready_hunger": 75}
+        first = {"guid": 104, "prefab": "cutstone", "kind": "pickup",
+                 "ready": True, "dx": 10, "dz": 0}
+        second = {"guid": 105, "prefab": "pickaxe", "kind": "pickup",
+                  "ready": True, "dx": 11, "dz": 0}
+        state = observation(local_entities=[first, second], inventory=inventory)
+        planner.start(state)
+        approach = planner.on_observation(state, "epoch")
+        self.assertEqual(approach["type"], "MOVE_TO_TARGET")
+        planner.record_command(1, approach)
+        arrived = observation(x=9, local_entities=[{**first, "dx": 1},
+                                                  {**second, "dx": 2}],
+                              inventory=inventory,
+                              movement={"epoch": "epoch", "id": 1,
+                                        "status": "arrived"})
+        pickup = planner.on_observation(arrived, "epoch")
+        self.assertEqual(pickup["type"], "PICKUP_TARGET")
+        self.assertEqual(pickup["behavior_id"], approach["behavior_id"])
 
     def test_long_walk_interrupts_to_collect_new_ground_loot(self):
         planner = SurvivalPlanner()

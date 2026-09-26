@@ -3,7 +3,7 @@
 # prefab: (Chinese label, desired inventory count, priority, pursuit radius)
 ITEM_CATALOG = {
     "flint": ("燧石", 6, 6, 12),
-    "rocks": ("石头", 6, 3, 8),
+    "rocks": ("石头", 8, 4, 12),
     "goldnugget": ("金块", 3, 5, 12),
     "cutgrass": ("草", 16, 6, 12),
     "twigs": ("树枝", 16, 6, 12),
@@ -23,7 +23,7 @@ ITEM_CATALOG = {
     "minerhat": ("矿工帽", 1, 9, 24),
     "torch": ("火炬", 2, 6, 12),
     "axe": ("斧头", 1, 5, 12),
-    "pickaxe": ("鹤嘴锄", 1, 5, 12),
+    "pickaxe": ("鹤嘴锄", 1, 6, 12),
     "shovel": ("铲子", 1, 3, 8),
     "hammer": ("锤子", 1, 3, 8),
     "beefalowool": ("牛毛", 12, 4, 14),
@@ -34,7 +34,7 @@ ITEM_CATALOG = {
     "spidergland": ("蜘蛛腺体", 5, 5, 14),
     "rope": ("绳子", 8, 4, 12),
     "boards": ("木板", 8, 4, 12),
-    "cutstone": ("石砖", 8, 4, 12),
+    "cutstone": ("石砖", 8, 6, 12),
     "charcoal": ("木炭", 8, 4, 12),
     "manure": ("粪便", 8, 3, 8),
     "nitre": ("硝石", 6, 3, 8),
