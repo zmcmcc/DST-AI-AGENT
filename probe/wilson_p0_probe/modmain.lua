@@ -1411,7 +1411,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.23.0",
+            mod_version = "0.24.0",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,
