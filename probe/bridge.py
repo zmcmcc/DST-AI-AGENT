@@ -11,7 +11,7 @@ from survival import SurvivalPlanner
 
 lock = threading.Lock()
 bridge_epoch = uuid.uuid4().hex
-MOD_VERSION = "0.20.0"
+MOD_VERSION = "0.21.0"
 autostart_guids = set()
 last_guid = None
 last_seq = None
@@ -413,6 +413,10 @@ class ProbeHandler(BaseHTTPRequestHandler):
                 prefab = entity.get("prefab")
                 sensed[prefab] = sensed.get(prefab, 0) + 1
             sensed_text = ",".join(f"{key}:{sensed[key]}" for key in sorted(sensed)) or "none"
+            hazards = message.get("visible_hazards") or []
+            hazard_text = ",".join(
+                f"{item.get('prefab')}:{(item.get('distance_sq') or 0) ** 0.5:.1f}"
+                for item in hazards[:8]) or "none"
             print(
                 f"seq={message['seq']} prefab={message.get('prefab')} "
                 f"guid={last_guid} cycles={message.get('cycles')} "
@@ -422,6 +426,7 @@ class ProbeHandler(BaseHTTPRequestHandler):
                 f"move_progress={movement.get('progress')} "
                 f"sense_radius={message.get('local_radius')} "
                 f"sensed={sensed_text} "
+                f"hazards={hazard_text} immediate={message.get('visible_threat_within_8')} "
                 f"truncated={message.get('local_entities_truncated')}",
                 flush=True,
             )

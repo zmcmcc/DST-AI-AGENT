@@ -137,6 +137,72 @@ class SurvivalPlannerTests(unittest.TestCase):
         self.assertEqual(choice["type"], "PICK_TARGET")
         self.assertEqual(choice["target_prefab"], "berrybush")
 
+    def test_nearby_grass_patch_stays_together_before_distant_twigs(self):
+        planner = SurvivalPlanner()
+        state = observation(local_entities=[
+            {"guid": 101, "prefab": "grass", "kind": "harvest", "ready": True,
+             "dx": 3, "dz": 0},
+            {"guid": 102, "prefab": "grass", "kind": "harvest", "ready": True,
+             "dx": 4, "dz": 1},
+            {"guid": 103, "prefab": "grass", "kind": "harvest", "ready": True,
+             "dx": 5, "dz": -1},
+            {"guid": 104, "prefab": "sapling", "kind": "harvest", "ready": True,
+             "dx": 5.5, "dz": 0},
+        ], inventory={"counts": {"cutgrass": 3, "twigs": 0, "torch": 0},
+                      "free_slots": 12})
+        planner.start(state)
+        choice = planner.on_observation(state, "epoch")
+        self.assertEqual(choice["type"], "GATHER_PATCH")
+        self.assertEqual([item["guid"] for item in choice["items"]], [101, 102, 103])
+        planner.record_command(1, choice)
+        self.assertIsNone(planner.on_observation(observation(
+            local_entities=state["local_entities"],
+            execution={"epoch": "epoch", "id": 1, "status": "started"}), "epoch"))
+        followup = planner.on_observation(observation(
+            local_entities=[state["local_entities"][3]],
+            inventory={"counts": {"cutgrass": 6, "twigs": 0, "torch": 0},
+                       "free_slots": 12},
+            execution={"epoch": "epoch", "id": 1, "status": "completed",
+                       "picked_count": 3, "inventory_delta": 3,
+                       "cluster_end_reason": "CLUSTER_EXHAUSTED"}), "epoch")
+        self.assertEqual(planner.picked_items, 3)
+        self.assertEqual(followup["target_guid"], 104)
+
+    def test_frog_away_from_berry_route_allows_harvest(self):
+        planner = SurvivalPlanner()
+        state = observation(local_entities=[
+            {"guid": 201, "prefab": "berrybush", "kind": "harvest", "ready": True,
+             "dx": 4, "dz": 0},
+        ], visible_hazards=[{"prefab": "frog", "dx": 0, "dz": 7}])
+        planner.start(state)
+        choice = planner.on_observation(state, "epoch")
+        self.assertEqual(choice["type"], "PICK_TARGET")
+        self.assertEqual(choice["target_guid"], 201)
+
+    def test_frog_on_berry_route_blocks_harvest(self):
+        planner = SurvivalPlanner()
+        state = observation(local_entities=[
+            {"guid": 201, "prefab": "berrybush", "kind": "harvest", "ready": True,
+             "dx": 7, "dz": 0},
+        ], visible_hazards=[{"prefab": "frog", "dx": 6, "dz": 0}])
+        planner.start(state)
+        choice = planner.on_observation(state, "epoch")
+        self.assertEqual(choice["type"], "MOVE_TO_POINT")
+        self.assertTrue(any("UNSAFE_FROG_ROUTE" in event for event in planner.events))
+
+    def test_frog_route_remains_avoided_after_short_escape(self):
+        planner = SurvivalPlanner()
+        first = observation(local_entities=[
+            {"guid": 201, "prefab": "berrybush", "kind": "harvest", "ready": True,
+             "dx": 7, "dz": 0},
+        ], visible_hazards=[{"prefab": "frog", "dx": 6, "dz": 0}])
+        planner.start(first)
+        later = observation(x=-6, local_entities=[
+            {"guid": 201, "prefab": "berrybush", "kind": "harvest", "ready": True,
+             "dx": 13, "dz": 0},
+        ], visible_hazards=[])
+        self.assertTrue(planner._route_near_frog(later, later["local_entities"][0]))
+
     def test_moves_toward_grass_visible_twelve_units_away(self):
         planner = SurvivalPlanner()
         state = observation(local_entities=[

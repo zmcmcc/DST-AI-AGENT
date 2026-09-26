@@ -13,6 +13,7 @@ TERMINAL_SUCCESS = {
     "PICK_TARGET": {"completed"},
     "PICKUP_TARGET": {"completed"},
     "LOOT_CLUSTER": {"completed"},
+    "GATHER_PATCH": {"completed"},
     "FELL_TREE": {"completed"},
     "MOVE_TO_TARGET": {"arrived"},
     "MOVE_TO_POINT": {"arrived"},
@@ -81,6 +82,7 @@ class SurvivalPlanner:
         self.blocked_cells = set()
         self.seen_resources = set()
         self.avoid_targets = {}
+        self.frog_zones = {}
         self.retry_after = {}
         self.heading = None
         self.eating_batch = False
@@ -167,7 +169,8 @@ class SurvivalPlanner:
         if self.action_id is not None:
             report_name = ("movement" if self.action_type.startswith("MOVE_") else
                            "execution" if self.action_type in ("PICK_TARGET", "PICKUP_TARGET",
-                                                               "FELL_TREE", "LOOT_CLUSTER") else "utility")
+                                                               "FELL_TREE", "LOOT_CLUSTER",
+                                                               "GATHER_PATCH") else "utility")
             report = observation.get(report_name) or {}
             ack = observation.get("command_ack") or {}
             status = None
@@ -191,28 +194,30 @@ class SurvivalPlanner:
                     self.events.append(f"fell_tree target={self.action_target} "
                                        f"work_delta={report.get('work_delta')} "
                                        f"tree_felled={report.get('tree_felled')}")
-                if self.action_type == "LOOT_CLUSTER":
+                if self.action_type in ("LOOT_CLUSTER", "GATHER_PATCH"):
                     picked = report.get("picked_count", 0)
                     success = success and isinstance(picked, int) and picked > 0
-                    self.events.append(f"loot_cluster result id={self.action_id} "
+                    self.events.append(f"{self.action_type.lower()} result id={self.action_id} "
                                        f"picked={picked} delta={report.get('inventory_delta')} "
                                        f"end={report.get('cluster_end_reason')}")
                     if isinstance(picked, int) and picked > 0:
                         self.picked_items += picked
-                        if self.loot_cluster is not None:
+                        if self.action_type == "LOOT_CLUSTER" and self.loot_cluster is not None:
                             self.loot_cluster["collected"] += picked
-                    self._end_cluster(report.get("cluster_end_reason") or "UNKNOWN")
+                    if self.action_type == "LOOT_CLUSTER":
+                        self._end_cluster(report.get("cluster_end_reason") or "UNKNOWN")
                 self._finish(success, status)
             elif (self.action_started_at is not None
                   and time.monotonic() - self.action_started_at > (
-                      50 if self.action_type == "LOOT_CLUSTER" else
+                      50 if self.action_type in ("LOOT_CLUSTER", "GATHER_PATCH") else
                       35 if self.action_type == "FELL_TREE" else 12)):
                 self._finish(False, "lost_action_report")
             else:
                 threat = observation.get("visible_threat_within_8")
                 if (threat is True and not self.action_escape
                         and self.action_type in ("PICK_TARGET", "PICKUP_TARGET",
-                                                 "FELL_TREE", "LOOT_CLUSTER", "MOVE_TO_TARGET",
+                                                 "FELL_TREE", "LOOT_CLUSTER", "GATHER_PATCH",
+                                                 "MOVE_TO_TARGET",
                                                  "MOVE_TO_POINT", "BUILD_CAMPFIRE",
                                                  "COOK_AT", "ADD_FUEL")):
                     if not self.stop_requested:
@@ -230,7 +235,8 @@ class SurvivalPlanner:
                 if (light_deadline and inventory.get("hand") != "torch"
                         and (inventory.get("counts") or {}).get("torch", 0) > 0
                         and self.action_type in ("PICK_TARGET", "PICKUP_TARGET",
-                                                 "FELL_TREE", "LOOT_CLUSTER", "MOVE_TO_TARGET",
+                                                 "FELL_TREE", "LOOT_CLUSTER", "GATHER_PATCH",
+                                                 "MOVE_TO_TARGET",
                                                  "MOVE_TO_POINT", "BUILD_CAMPFIRE",
                                                  "COOK_AT", "ADD_FUEL")
                         and not self.stop_requested):
@@ -287,6 +293,8 @@ class SurvivalPlanner:
                                    "rejected_point")):
                 self._mark_visit(*self.action_point, amount=4)
                 self.blocked_cells.add(self._cell(*self.action_point))
+        if status == "interrupted_threat" and self.action_target is not None:
+            self.avoid_targets[self.action_target] = time.monotonic() + 20
         if status in ("interrupted_threat", "interrupted_light", "stopped") and self.loot_cluster:
             self._end_cluster("SAFETY_INTERRUPT")
         if self.action_type == "LOOT_CLUSTER" and self.loot_cluster is not None:
@@ -331,6 +339,9 @@ class SurvivalPlanner:
             if (world_x - cluster["x"]) ** 2 + (world_z - cluster["z"]) ** 2 > 36:
                 continue
             distance = (dx * dx + dz * dz) ** 0.5
+            if self._route_near_frog(observation, entity):
+                rejected.append(f"{entity.get('prefab')}:{entity.get('guid')}=UNSAFE_FROG_ROUTE")
+                continue
             offer = loose_item_offer(entity.get("prefab"),
                                      counts.get(entity.get("prefab"), 0),
                                      free_slots, distance)
@@ -387,6 +398,27 @@ class SurvivalPlanner:
     def _cell(x, z):
         return (round(x / 4), round(z / 4))
 
+    def _route_near_frog(self, observation, target):
+        dx, dz = target.get("dx"), target.get("dz")
+        if not isinstance(dx, (int, float)) or not isinstance(dz, (int, float)):
+            return False
+        length_sq = dx * dx + dz * dz
+        hazards = [(item.get("dx"), item.get("dz"))
+                   for item in observation.get("visible_hazards") or []
+                   if item.get("prefab") == "frog"]
+        x, z = observation.get("x"), observation.get("z")
+        if isinstance(x, (int, float)) and isinstance(z, (int, float)):
+            hazards.extend((world_x - x, world_z - z)
+                           for world_x, world_z, expiry in self.frog_zones.values()
+                           if expiry > time.monotonic())
+        for hx, hz in hazards:
+            if not isinstance(hx, (int, float)) or not isinstance(hz, (int, float)):
+                continue
+            progress = max(0, min(1, (hx * dx + hz * dz) / max(length_sq, 0.01)))
+            if (hx - progress * dx) ** 2 + (hz - progress * dz) ** 2 < 20.25:
+                return True
+        return False
+
     def _mark_visit(self, x, z, amount=1):
         if isinstance(x, (int, float)) and isinstance(z, (int, float)):
             cell = self._cell(x, z)
@@ -396,6 +428,17 @@ class SurvivalPlanner:
         x, z = observation.get("x"), observation.get("z")
         if not isinstance(x, (int, float)) or not isinstance(z, (int, float)):
             return
+        now = time.monotonic()
+        self.frog_zones = {cell: zone for cell, zone in self.frog_zones.items()
+                           if zone[2] > now}
+        for hazard in observation.get("visible_hazards") or []:
+            dx, dz = hazard.get("dx"), hazard.get("dz")
+            if (hazard.get("prefab") == "frog"
+                    and isinstance(dx, (int, float))
+                    and isinstance(dz, (int, float))):
+                world_x, world_z = x + dx, z + dz
+                self.frog_zones[self._cell(world_x, world_z)] = (world_x, world_z,
+                                                                 now + 30)
         self._mark_visible_cells(x, z)
         for entity in observation.get("local_entities") or []:
             if entity.get("ready") is True and isinstance(entity.get("guid"), int):
@@ -664,6 +707,9 @@ class SurvivalPlanner:
                 rejected.append(f"{label}=OUTSIDE_ALLOWED_RADIUS")
                 continue
             distance = distance_sq ** 0.5
+            if self._route_near_frog(observation, target):
+                rejected.append(f"{label}=UNSAFE_FROG_ROUTE")
+                continue
             matched = False
             for resource, prefabs in RESOURCE_PREFABS.items():
                 if target.get("prefab") not in prefabs:
@@ -682,8 +728,21 @@ class SurvivalPlanner:
                 value_bonus = (1 if target["prefab"] in ("carrot", "carrot_planted")
                                else 0.5 if target["prefab"] in
                                ("berrybush", "berrybush2", "berrybush_juicy") else 0)
-                near_bonus = 5 if distance_sq <= 6.25 else 0
-                score = priority + value_bonus + near_bonus - 0.7 * distance
+                near_bonus = (0 if critical_hunger and resource != "food" else
+                              8 if distance_sq <= 36 else 0)
+                patch_bonus = 0
+                if target.get("kind") == "harvest" and not (critical_hunger and resource != "food"):
+                    patch_size = sum(1 for item in nearby
+                                     if item.get("kind") == "harvest"
+                                     and item.get("prefab") == target["prefab"]
+                                     and item.get("ready") is True
+                                     and self.avoid_targets.get(item.get("guid"), 0) <= now
+                                     and (item.get("dx", 99) - target["dx"]) ** 2
+                                     + (item.get("dz", 99) - target["dz"]) ** 2 <= 36
+                                     and item.get("dx", 99) ** 2 + item.get("dz", 99) ** 2 <= 144
+                                     and not self._route_near_frog(observation, item))
+                    patch_bonus = 3 * min(3, max(0, patch_size - 1))
+                score = priority + value_bonus + near_bonus + patch_bonus - 0.7 * distance
                 candidates.append((-score, distance_sq, target["guid"], resource, target))
             if target.get("kind") == "pickup" and not matched:
                 offer = loose_item_offer(target.get("prefab"),
@@ -691,7 +750,7 @@ class SurvivalPlanner:
                                          free_slots, distance)
                 if offer is not None:
                     priority, _ = offer
-                    score = priority + (5 if distance_sq <= 6.25 else 0) - 0.7 * distance
+                    score = priority + (8 if distance_sq <= 36 else 0) - 0.7 * distance
                     candidates.append((-score, distance_sq, target["guid"], "loot", target))
                 else:
                     desired = ITEM_CATALOG.get(target.get("prefab"), (None, 1, 1, 3))[1]
@@ -710,6 +769,35 @@ class SurvivalPlanner:
                 f"decision={self.decision_seq} chosen={target['prefab']}:{target['guid']} "
                 f"top=[{top_text}] "
                 f"rejected=[{', '.join(rejected[:8])}] free_slots={free_slots}")
+            if (target.get("kind") == "harvest"
+                    and target["dx"] ** 2 + target["dz"] ** 2 <= 64
+                    and free_slots > 0):
+                members = [item for item in nearby
+                           if item.get("kind") == "harvest" and item.get("ready") is True
+                           and item.get("prefab") == target["prefab"]
+                           and self.avoid_targets.get(item.get("guid"), 0) <= now
+                           and (item.get("dx", 99) - target["dx"]) ** 2
+                           + (item.get("dz", 99) - target["dz"]) ** 2 <= 36
+                           and item.get("dx", 99) ** 2 + item.get("dz", 99) ** 2 <= 144
+                           and not self._route_near_frog(observation, item)]
+                if len(members) >= 2:
+                    others = sorted((item for item in members
+                                     if item["guid"] != target["guid"]),
+                                    key=lambda item: ((item["dx"] - target["dx"]) ** 2
+                                                      + (item["dz"] - target["dz"]) ** 2,
+                                                      item["guid"]))
+                    items = [{"guid": item["guid"], "prefab": item["prefab"]}
+                             for item in [target, *others[:7]]]
+                    self.behavior_seq += 1
+                    behavior_id = f"patch-{self.behavior_seq}"
+                    self.events.append(f"gather_patch id={behavior_id} batch=["
+                                       + ",".join(f"{item['prefab']}:{item['guid']}"
+                                                  for item in items) + "]")
+                    goal = "food" if resource == "food" else "light"
+                    return {"type": "GATHER_PATCH", "items": items,
+                            "target_guid": target["guid"],
+                            "behavior_id": behavior_id, "goal": goal,
+                            "say": "这片有用的资源，我顺手采完"}
             if (target.get("kind") == "pickup" and phase != "night"
                     and not critical_hunger and not night_imminent):
                 x, z = observation.get("x"), observation.get("z")
@@ -750,6 +838,8 @@ class SurvivalPlanner:
         for index, point in enumerate(frontier):
             dx, dz = point.get("dx"), point.get("dz")
             if point.get("passable") is not True or not isinstance(dx, (int, float)) or not isinstance(dz, (int, float)):
+                continue
+            if self._route_near_frog(observation, point):
                 continue
             if (phase == "night" and ready_light_seconds < night_seconds + 30
                     and dx * dx + dz * dz > 64):

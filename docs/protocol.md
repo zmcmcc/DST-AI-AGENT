@@ -1,6 +1,6 @@
 # P0 探针消息
 
-本协议定义本机状态交换、手动探针、0.7.0 的有限自主采集，以及 0.20.0 的连续首夜生存和第二天木头、营火与烹饪任务。完整首夜仍待真实游戏验收。
+本协议定义本机状态交换、手动探针、0.7.0 的有限自主采集，以及 0.21.0 的连续首夜生存和第二天木头、营火与烹饪任务。完整首夜仍待真实游戏验收。
 
 Lua 在 0.6.0 起每 1 游戏秒向 `http://127.0.0.1:8765/probe` 发送一次 POST JSON；正常回执日志每 10 条采样一次，失败和动作变化仍单独记录：
 
@@ -17,6 +17,8 @@ Python 立即返回 HTTP 200：
 Lua 只接受 `probe`、`seq`、`ack` 全部匹配的回执，并将结果写入 DST 日志。若一条请求超过 10 游戏秒仍未回调，下一轮可重试新序号。
 
 `vitals` 读取服务端威尔逊组件中的当前生命、饥饿、理智及其当前上限；缺失的组件报告 `status=unknown`。`local_entities` 扫描角色周围 40 游戏单位内的常见可采植物、树，以及所有带可拾取组件的地面物品；优先保留每种 prefab 最近的一件，再按距离填充至 64 项，并经游戏脚本的可见性函数筛选。可采植物的 `ready` 来自 `pickable:CanBePicked()`，地面物品的 `ready` 来自其拾取组件。另上报 `local_entities_truncated` 和独立扫描的 `visible_threat_within_8`。40 单位是依据本机游戏脚本中默认相机最大距离 50 与视场角 35° 选的近似覆盖范围，屏幕边缘会受视角和分辨率影响。实体 GUID 只作当前世界实例中的临时引用。
+
+0.21.0 的 `visible_hazards` 记录 8 单位内可见危险生物的种类、相对坐标、距离平方及是否锁定威尔逊。普通青蛙进入游戏警戒距离附近或已锁定威尔逊时，才计入 `visible_threat_within_8`；其他现有危险生物仍按 8 单位处理。Python 对经过青蛙警戒范围的目标路线进行过滤，并短时记住见过的青蛙位置，避免逃开后立刻重走原路线。
 
 本机服务保存最新一条观察，`GET http://127.0.0.1:8765/latest` 返回观察和服务端接收后的经过秒数，供调试使用；它不会触发游戏动作。
 
@@ -57,3 +59,5 @@ Lua 只接受 `probe`、`seq`、`ack` 全部匹配的回执，并将结果写入
 0.19.0 对 8 单位内的可采、可拾、可砍目标直接下发 `PICK_TARGET`、`PICKUP_TARGET`、`FELL_TREE`，由 DST 的 `BufferedAction` 与 locomotor 完成接近和交互；客户端保留走路预览。`FELL_TREE` 在一次命令中连续提交砍击，以 `tree_felled` 和累计 `work_delta` 确认倒树。Python 为一组 6 单位内地面物品保留 `loot_cluster` 行为 ID，在安全、库存、时间预算内逐件拾取；该行为仍由多条拾取命令构成。桥接日志在资源决策时记录 Top-5 分数、过滤原因和行为 ID。以上运行效果待实机验证。
 
 0.20.0 将 `loot_cluster` 的近处拾取合并为一条 `LOOT_CLUSTER` 命令，携带至多 12 个目标 GUID 与 prefab；Lua 连续执行 `PICKUP`，最多 45 游戏秒，逐件验证库存增量，并在终态回报 `picked_count`、总 `inventory_delta` 与 `cluster_end_reason`（如 `CLUSTER_EXHAUSTED`、`INVENTORY_LIMIT`、`SAFETY_INTERRUPT`、`TASK_BUDGET_REACHED`）。远处物资组先用同一行为 ID 接近，再启动这条命令。实机效果待验证。
+
+0.21.0 的 `GATHER_PATCH` 同样携带一组目标，针对近处同类可采植物连续执行 `PICK`。`PICK_TARGET`、`PICKUP_TARGET`、`FELL_TREE`、`LOOT_CLUSTER` 和 `GATHER_PATCH` 在远于交互距离时，先由 Lua 控制接近，再衔接原生动作；客户端移动预览只覆盖接近阶段。批次内不逐株交还 Python 重新评分。

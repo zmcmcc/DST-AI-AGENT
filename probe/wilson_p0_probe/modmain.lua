@@ -1,6 +1,7 @@
 local G = GLOBAL
 local URL = "http://127.0.0.1:8765/probe"
 local SENSE_RADIUS = 8
+local FROG_DANGER_RADIUS_SQ = ((G.TUNING.FROG_TARGET_DIST or 4) + 0.5) ^ 2
 local RESOURCE_RADIUS = 40
 local MAX_LOCAL_ENTITIES = 64
 local OBSERVED_PREFABS = {
@@ -377,16 +378,29 @@ local function ReadVisibleHazards(inst, radius)
     local threat_visible = false
     local nearest_threat = nil
     local nearest_distance_sq = nil
+    local hazards = {}
     for _, entity in G.ipairs(entities) do
         if THREAT_PREFABS[entity.prefab] and G.CanEntitySeeTarget(inst, entity) then
-            threat_visible = true
             if entity.prefab == "frog" then
                 frog_visible = true
             end
             local ex, _, ez = entity.Transform:GetWorldPosition()
             local dx, dz = ex - x, ez - z
             local distance_sq = dx * dx + dz * dz
-            if nearest_distance_sq == nil or distance_sq < nearest_distance_sq then
+            local combat = entity.components.combat
+            local targeting_player = combat ~= nil and combat.target == inst
+            hazards[#hazards + 1] = {
+                prefab = entity.prefab,
+                dx = dx,
+                dz = dz,
+                distance_sq = distance_sq,
+                targeting_player = targeting_player,
+            }
+            local immediate = entity.prefab ~= "frog" or targeting_player
+                or distance_sq <= FROG_DANGER_RADIUS_SQ
+            if immediate and (nearest_distance_sq == nil
+                or distance_sq < nearest_distance_sq) then
+                threat_visible = true
                 nearest_distance_sq = distance_sq
                 nearest_threat = {
                     prefab = entity.prefab,
@@ -397,7 +411,7 @@ local function ReadVisibleHazards(inst, radius)
             end
         end
     end
-    return frog_visible, threat_visible, nearest_threat
+    return frog_visible, threat_visible, nearest_threat, hazards
 end
 
 local function HasVisibleThreat(inst, radius)
@@ -552,13 +566,84 @@ AddPlayerPostInit(function(inst)
         end
     end
 
+    local function PushApproachedAction(pick, target, action, preview_id, on_failed)
+        local locomotor = inst.components.locomotor
+        local function push()
+            if active_pick ~= pick or pick.status ~= "started" then
+                return
+            end
+            if not target:IsValid() then
+                on_failed()
+                return
+            end
+            local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
+            if not ok then
+                on_failed()
+            end
+        end
+        if inst:GetDistanceSqToInst(target) <= 4 then
+            push()
+            return
+        end
+        local ok = G.pcall(locomotor.GoToEntity, locomotor, target, nil, false)
+        if not ok then
+            on_failed()
+            return
+        end
+        pick.approaching = true
+        pick.approach_dest = locomotor.dest
+        StartPickPreview(pick, target, preview_id)
+        local started = G.GetTime()
+        local function check_approach()
+            if active_pick ~= pick or pick.status ~= "started"
+                or pick.action ~= action or not pick.approaching then
+                return
+            end
+            if not target:IsValid() or G.GetTime() - started > 8 then
+                pick.approaching = false
+                StopPickPreview(pick)
+                if locomotor.dest == pick.approach_dest then
+                    locomotor:Stop()
+                end
+                on_failed()
+            elseif inst:GetDistanceSqToInst(target) <= 4 then
+                pick.approaching = false
+                if locomotor.dest == pick.approach_dest then
+                    locomotor:Stop()
+                end
+                StopPickPreview(pick)
+                inst:DoTaskInTime(0.1, push)
+            else
+                inst:DoTaskInTime(0.1, check_approach)
+            end
+        end
+        inst:DoTaskInTime(0.1, check_approach)
+    end
+
+    local function StopPickMotion(pick)
+        local locomotor = inst.components.locomotor
+        if locomotor ~= nil then
+            if pick.approaching and pick.approach_dest ~= nil
+                and locomotor.dest == pick.approach_dest then
+                locomotor:Stop()
+            elseif pick.action ~= nil and inst:GetBufferedAction() == pick.action then
+                inst:ClearBufferedAction()
+                locomotor:Clear()
+                locomotor:Stop()
+            end
+        end
+        pick.approaching = false
+        StopPickPreview(pick)
+    end
+
     local function SetPickStatus(pick, status)
         if active_pick == pick then
             if status ~= "started" and status ~= "received"
                 and pick.preview_id ~= nil then
                 StopPickPreview(pick)
             end
-            if pick.type == "LOOT_CLUSTER" and status ~= "started"
+            if (pick.type == "LOOT_CLUSTER" or pick.type == "GATHER_PATCH")
+                and status ~= "started"
                 and status ~= "received" and pick.cluster_end_reason == nil then
                 pick.cluster_end_reason = status == "interrupted_threat"
                     and "SAFETY_INTERRUPT" or status == "interrupted_light"
@@ -833,22 +918,13 @@ AddPlayerPostInit(function(inst)
 
         SetPickStatus(pick, "started")
         SayIntent(command, "我去采些资源")
-        local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
-        if not ok then
-            SetPickStatus(pick, "failed")
-            return
-        end
-        StartPickPreview(pick, target)
+        PushApproachedAction(pick, target, action, nil, function()
+            SetPickStatus(pick, "failed_approach")
+        end)
         inst:DoTaskInTime(auto_pick and 10 or 6, function()
             if inst:IsValid() and active_pick == pick and pick.status == "started" then
-                if inst:GetBufferedAction() == action then
-                    SetPickStatus(pick, "timed_out")
-                    inst:ClearBufferedAction()
-                    locomotor:Clear()
-                    locomotor:Stop()
-                else
-                    SetPickStatus(pick, "failed_or_interrupted")
-                end
+                StopPickMotion(pick)
+                SetPickStatus(pick, "timed_out")
             end
         end)
     end
@@ -900,25 +976,18 @@ AddPlayerPostInit(function(inst)
         end)
         SetPickStatus(pickup, "started")
         SayIntent(command, "我去捡些资源")
-        local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
-        if not ok then
-            SetPickStatus(pickup, "failed")
-            return
-        end
-        StartPickPreview(pickup, target)
+        PushApproachedAction(pickup, target, action, nil, function()
+            SetPickStatus(pickup, "failed_approach")
+        end)
         inst:DoTaskInTime(10, function()
             if inst:IsValid() and active_pick == pickup and pickup.status == "started" then
-                if inst:GetBufferedAction() == action then
-                    inst:ClearBufferedAction()
-                    locomotor:Clear()
-                    locomotor:Stop()
-                end
+                StopPickMotion(pickup)
                 SetPickStatus(pickup, "timed_out_or_interrupted")
             end
         end)
     end
 
-    local function StartLootCluster(command)
+    local function StartGatherGroup(command)
         if (active_pick ~= nil and active_pick.status == "started")
             or (active_move ~= nil and active_move.status == "started")
             or (active_utility ~= nil and active_utility.status == "started") then
@@ -926,10 +995,11 @@ AddPlayerPostInit(function(inst)
             return
         end
         local items = command.items
+        local harvesting = command.type == "GATHER_PATCH"
         local cluster = {
             epoch = command.epoch,
             id = command.id,
-            type = "LOOT_CLUSTER",
+            type = command.type,
             target_guid = items[1].guid,
             status = "received",
             inventory_delta = 0,
@@ -975,9 +1045,12 @@ AddPlayerPostInit(function(inst)
                 local entity = G.Ents[candidate.guid]
                 if entity ~= nil and entity:IsValid()
                     and entity.prefab == candidate.prefab
-                    and entity.components.inventoryitem ~= nil
-                    and entity.components.inventoryitem.owner == nil
-                    and entity.components.inventoryitem.canbepickedup
+                    and ((harvesting and HARVEST_PRODUCTS[entity.prefab] ~= nil
+                        and entity.components.pickable ~= nil
+                        and entity.components.pickable:CanBePicked())
+                        or (not harvesting and entity.components.inventoryitem ~= nil
+                        and entity.components.inventoryitem.owner == nil
+                        and entity.components.inventoryitem.canbepickedup))
                     and G.CanEntitySeeTarget(inst, entity)
                     and inst:GetDistanceSqToInst(entity) <= 256 then
                     entry, target = candidate, entity
@@ -991,14 +1064,16 @@ AddPlayerPostInit(function(inst)
                 return
             end
             cluster.target_guid = entry.guid
-            local before = CountInventoryItem(inst, entry.prefab)
-            local action = G.BufferedAction(inst, target, G.ACTIONS.PICKUP)
+            local product = harvesting and HARVEST_PRODUCTS[entry.prefab] or entry.prefab
+            local before = CountInventoryItem(inst, product)
+            local action = G.BufferedAction(inst, target,
+                harvesting and G.ACTIONS.PICK or G.ACTIONS.PICKUP)
             cluster.action = action
             action:AddSuccessAction(function()
-                if cluster.status ~= "started" then
+                if cluster.status ~= "started" or cluster.action ~= action then
                     return
                 end
-                local delta = CountInventoryItem(inst, entry.prefab) - before
+                local delta = CountInventoryItem(inst, product) - before
                 if delta > 0 then
                     cluster.inventory_delta = cluster.inventory_delta + delta
                     cluster.picked_count = cluster.picked_count + 1
@@ -1010,31 +1085,28 @@ AddPlayerPostInit(function(inst)
                 inst:DoTaskInTime(0, next_pick)
             end)
             action:AddFailAction(function()
-                if cluster.status == "started" then
+                if cluster.status == "started" and cluster.action == action then
                     StopPickPreview(cluster)
                     G.print("[Wilson P0] cluster id=" .. cluster.id
                         .. " failed target=" .. entry.guid)
                     inst:DoTaskInTime(0, next_pick)
                 end
             end)
-            local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
-            if ok then
-                StartPickPreview(cluster, target, command.id * 100 + cluster.index)
-            else
+            PushApproachedAction(cluster, target, action,
+                command.id * 100 + cluster.index, function()
+                G.print("[Wilson P0] cluster id=" .. cluster.id
+                    .. " approach failed target=" .. entry.guid)
                 inst:DoTaskInTime(0, next_pick)
-            end
+            end)
         end
         SetPickStatus(cluster, "started")
-        SayIntent(command, "我把附近的物资捡起来")
+        SayIntent(command, harvesting and "这片资源我顺手采完"
+            or "我把附近的物资捡起来")
         next_pick()
         inst:DoTaskInTime(45, function()
             if inst:IsValid() and active_pick == cluster
                 and cluster.status == "started" then
-                if inst:GetBufferedAction() == cluster.action then
-                    inst:ClearBufferedAction()
-                    locomotor:Clear()
-                    locomotor:Stop()
-                end
+                StopPickMotion(cluster)
                 finish("TASK_BUDGET_REACHED", cluster.picked_count > 0
                     and "completed" or "timed_out")
             end
@@ -1131,30 +1203,24 @@ AddPlayerPostInit(function(inst)
                     SetPickStatus(chop, "failed_or_interrupted")
                 end
             end)
-            local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
-            if not ok then
-                SetPickStatus(chop, "failed")
-            elseif chop.preview_id == nil and chop.work_delta == nil then
-                StartPickPreview(chop, target)
-            end
+            PushApproachedAction(chop, target, action, nil, function()
+                SetPickStatus(chop, "failed_approach")
+            end)
         end
         SetPickStatus(chop, "started")
         SayIntent(command, "我来砍倒这棵树")
         push_next_chop()
         inst:DoTaskInTime(30, function()
             if inst:IsValid() and active_pick == chop and chop.status == "started" then
-                if inst:GetBufferedAction() == chop.action then
-                    inst:ClearBufferedAction()
-                    locomotor:Clear()
-                    locomotor:Stop()
-                end
+                StopPickMotion(chop)
                 SetPickStatus(chop, "timed_out")
             end
         end)
     end
 
     inst:DoPeriodicTask(0.5, function()
-        local frog_visible, threat_visible, nearest_threat = ReadVisibleHazards(inst, SENSE_RADIUS)
+        local frog_visible, threat_visible, nearest_threat, visible_hazards =
+            ReadVisibleHazards(inst, SENSE_RADIUS)
         local locomotor = inst.components.locomotor
         local inventory = inst.components.inventory
         local clock = G.TheWorld.net ~= nil and G.TheWorld.net.components.clock or nil
@@ -1187,13 +1253,11 @@ AddPlayerPostInit(function(inst)
                     FinishMove(active_move, "interrupted_light")
                 elseif not replace_now and active_pick ~= nil and active_pick.status == "started"
                     and locomotor ~= nil and (inst:GetBufferedAction() == active_pick.action
+                        or active_pick.approaching
                         or active_pick.type == "FELL_TREE"
-                        or active_pick.type == "LOOT_CLUSTER") then
-                    if inst:GetBufferedAction() == active_pick.action then
-                        inst:ClearBufferedAction()
-                        locomotor:Clear()
-                        locomotor:Stop()
-                    end
+                        or active_pick.type == "LOOT_CLUSTER"
+                        or active_pick.type == "GATHER_PATCH") then
+                    StopPickMotion(active_pick)
                     SetPickStatus(active_pick, "interrupted_light")
                 elseif not replace_now and active_utility ~= nil and active_utility.status == "started"
                     and locomotor ~= nil and inst:GetBufferedAction() == active_utility.action then
@@ -1219,13 +1283,11 @@ AddPlayerPostInit(function(inst)
                 SayIntent({}, "附近有危险，我先停下")
             elseif active_pick ~= nil and active_pick.status == "started"
                 and (inst:GetBufferedAction() == active_pick.action
+                    or active_pick.approaching
                     or active_pick.type == "FELL_TREE"
-                    or active_pick.type == "LOOT_CLUSTER") then
-                if inst:GetBufferedAction() == active_pick.action then
-                    inst:ClearBufferedAction()
-                    locomotor:Clear()
-                    locomotor:Stop()
-                end
+                    or active_pick.type == "LOOT_CLUSTER"
+                    or active_pick.type == "GATHER_PATCH") then
+                StopPickMotion(active_pick)
                 SetPickStatus(active_pick, "interrupted_threat")
                 SayIntent({}, "附近有危险，我先停下")
             elseif active_utility ~= nil and active_utility.status == "started"
@@ -1338,7 +1400,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.20.0",
+            mod_version = "0.21.0",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,
@@ -1363,6 +1425,7 @@ AddPlayerPostInit(function(inst)
             visible_frog_within_8 = frog_visible,
             visible_threat_within_8 = threat_visible,
             nearest_threat = nearest_threat,
+            visible_hazards = visible_hazards,
             frontier = ReadFrontier(x, z),
             command_ack = command_ack,
             execution = active_pick ~= nil and {
@@ -1558,14 +1621,15 @@ AddPlayerPostInit(function(inst)
                     and key ~= last_command_key then
                     last_command_key = key
                     StartPickup(command)
-                elseif command.type == "LOOT_CLUSTER" and command.guid == inst.GUID
+                elseif (command.type == "LOOT_CLUSTER"
+                    or command.type == "GATHER_PATCH") and command.guid == inst.GUID
                     and G.type(command.epoch) == "string" and G.type(command.id) == "number"
                     and G.type(command.items) == "table" and #command.items >= 1
                     and #command.items <= 12 and G.type(command.items[1]) == "table"
                     and G.type(command.items[1].guid) == "number"
                     and key ~= last_command_key then
                     last_command_key = key
-                    StartLootCluster(command)
+                    StartGatherGroup(command)
                 elseif command.type == "FELL_TREE" and command.guid == inst.GUID
                     and G.type(command.epoch) == "string" and G.type(command.id) == "number"
                     and G.type(command.target_guid) == "number"
@@ -1613,20 +1677,9 @@ AddPlayerPostInit(function(inst)
                         end
                     elseif active_pick ~= nil and active_pick.id == command.target_id
                         and active_pick.status == "started" and locomotor ~= nil then
-                        if inst:GetBufferedAction() == active_pick.action then
-                            SetPickStatus(active_pick, "stopped")
-                            inst:ClearBufferedAction()
-                            locomotor:Clear()
-                            locomotor:Stop()
-                            status = "stopped_pick"
-                        elseif active_pick.type == "FELL_TREE"
-                            or active_pick.type == "LOOT_CLUSTER" then
-                            SetPickStatus(active_pick, "stopped")
-                            status = "stopped_pick"
-                        else
-                            SetPickStatus(active_pick, "failed_or_interrupted")
-                            status = "already_released"
-                        end
+                        StopPickMotion(active_pick)
+                        SetPickStatus(active_pick, "stopped")
+                        status = "stopped_pick"
                     elseif active_utility ~= nil and active_utility.id == command.target_id
                         and active_utility.status == "started" and locomotor ~= nil then
                         if inst:GetBufferedAction() == active_utility.action then
