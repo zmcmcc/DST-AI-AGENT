@@ -642,7 +642,8 @@ AddPlayerPostInit(function(inst)
                 and pick.preview_id ~= nil then
                 StopPickPreview(pick)
             end
-            if (pick.type == "LOOT_CLUSTER" or pick.type == "GATHER_PATCH")
+            if (pick.type == "LOOT_CLUSTER" or pick.type == "GATHER_PATCH"
+                or pick.type == "COLLECT_AREA")
                 and status ~= "started"
                 and status ~= "received" and pick.cluster_end_reason == nil then
                 pick.cluster_end_reason = status == "interrupted_threat"
@@ -995,7 +996,6 @@ AddPlayerPostInit(function(inst)
             return
         end
         local items = command.items
-        local harvesting = command.type == "GATHER_PATCH"
         local cluster = {
             epoch = command.epoch,
             id = command.id,
@@ -1043,12 +1043,16 @@ AddPlayerPostInit(function(inst)
                 cluster.index = cluster.index + 1
                 local candidate = items[cluster.index]
                 local entity = G.Ents[candidate.guid]
+                local harvesting = command.type == "GATHER_PATCH"
+                    or (command.type == "COLLECT_AREA" and candidate.kind == "harvest")
+                local gathering = command.type == "LOOT_CLUSTER"
+                    or (command.type == "COLLECT_AREA" and candidate.kind == "pickup")
                 if entity ~= nil and entity:IsValid()
                     and entity.prefab == candidate.prefab
                     and ((harvesting and HARVEST_PRODUCTS[entity.prefab] ~= nil
                         and entity.components.pickable ~= nil
                         and entity.components.pickable:CanBePicked())
-                        or (not harvesting and entity.components.inventoryitem ~= nil
+                        or (gathering and entity.components.inventoryitem ~= nil
                         and entity.components.inventoryitem.owner == nil
                         and entity.components.inventoryitem.canbepickedup))
                     and G.CanEntitySeeTarget(inst, entity)
@@ -1064,6 +1068,8 @@ AddPlayerPostInit(function(inst)
                 return
             end
             cluster.target_guid = entry.guid
+            local harvesting = command.type == "GATHER_PATCH"
+                or (command.type == "COLLECT_AREA" and entry.kind == "harvest")
             local product = harvesting and HARVEST_PRODUCTS[entry.prefab] or entry.prefab
             local before = CountInventoryItem(inst, product)
             local action = G.BufferedAction(inst, target,
@@ -1100,7 +1106,9 @@ AddPlayerPostInit(function(inst)
             end)
         end
         SetPickStatus(cluster, "started")
-        SayIntent(command, harvesting and "这片资源我顺手采完"
+        SayIntent(command, command.type == "COLLECT_AREA"
+            and "这一片有用的东西，我一起收集"
+            or command.type == "GATHER_PATCH" and "这片资源我顺手采完"
             or "我把附近的物资捡起来")
         next_pick()
         inst:DoTaskInTime(45, function()
@@ -1256,7 +1264,8 @@ AddPlayerPostInit(function(inst)
                         or active_pick.approaching
                         or active_pick.type == "FELL_TREE"
                         or active_pick.type == "LOOT_CLUSTER"
-                        or active_pick.type == "GATHER_PATCH") then
+                        or active_pick.type == "GATHER_PATCH"
+                        or active_pick.type == "COLLECT_AREA") then
                     StopPickMotion(active_pick)
                     SetPickStatus(active_pick, "interrupted_light")
                 elseif not replace_now and active_utility ~= nil and active_utility.status == "started"
@@ -1286,7 +1295,8 @@ AddPlayerPostInit(function(inst)
                     or active_pick.approaching
                     or active_pick.type == "FELL_TREE"
                     or active_pick.type == "LOOT_CLUSTER"
-                    or active_pick.type == "GATHER_PATCH") then
+                    or active_pick.type == "GATHER_PATCH"
+                    or active_pick.type == "COLLECT_AREA") then
                 StopPickMotion(active_pick)
                 SetPickStatus(active_pick, "interrupted_threat")
                 SayIntent({}, "附近有危险，我先停下")
@@ -1400,7 +1410,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.21.0",
+            mod_version = "0.22.0",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,
@@ -1622,7 +1632,8 @@ AddPlayerPostInit(function(inst)
                     last_command_key = key
                     StartPickup(command)
                 elseif (command.type == "LOOT_CLUSTER"
-                    or command.type == "GATHER_PATCH") and command.guid == inst.GUID
+                    or command.type == "GATHER_PATCH"
+                    or command.type == "COLLECT_AREA") and command.guid == inst.GUID
                     and G.type(command.epoch) == "string" and G.type(command.id) == "number"
                     and G.type(command.items) == "table" and #command.items >= 1
                     and #command.items <= 12 and G.type(command.items[1]) == "table"

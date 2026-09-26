@@ -14,6 +14,7 @@ TERMINAL_SUCCESS = {
     "PICKUP_TARGET": {"completed"},
     "LOOT_CLUSTER": {"completed"},
     "GATHER_PATCH": {"completed"},
+    "COLLECT_AREA": {"completed"},
     "FELL_TREE": {"completed"},
     "MOVE_TO_TARGET": {"arrived"},
     "MOVE_TO_POINT": {"arrived"},
@@ -91,7 +92,7 @@ class SurvivalPlanner:
         self.events = []
         self.decision_seq = 0
         self.behavior_seq = 0
-        self.loot_cluster = None
+        self.collect_area = None
         self.action_behavior_id = None
 
     def status(self):
@@ -102,8 +103,8 @@ class SurvivalPlanner:
             "reason": self.reason,
             "action_id": self.action_id,
             "action_type": self.action_type,
-            "behavior_id": self.action_behavior_id or (self.loot_cluster or {}).get("id"),
-            "loot_cluster": self.loot_cluster,
+            "behavior_id": self.action_behavior_id or (self.collect_area or {}).get("id"),
+            "collect_area": self.collect_area,
             "completed": self.completed,
             "failed": self.failed,
             "picked_items": self.picked_items,
@@ -131,7 +132,7 @@ class SurvivalPlanner:
     def stop(self):
         self.enabled = False
         self.reason = "stopped"
-        self._end_cluster("STOPPED")
+        self._end_area("STOPPED")
 
     def command_expired(self, command_id):
         if self.action_id == command_id:
@@ -170,7 +171,7 @@ class SurvivalPlanner:
             report_name = ("movement" if self.action_type.startswith("MOVE_") else
                            "execution" if self.action_type in ("PICK_TARGET", "PICKUP_TARGET",
                                                                "FELL_TREE", "LOOT_CLUSTER",
-                                                               "GATHER_PATCH") else "utility")
+                                                               "GATHER_PATCH", "COLLECT_AREA") else "utility")
             report = observation.get(report_name) or {}
             ack = observation.get("command_ack") or {}
             status = None
@@ -194,7 +195,7 @@ class SurvivalPlanner:
                     self.events.append(f"fell_tree target={self.action_target} "
                                        f"work_delta={report.get('work_delta')} "
                                        f"tree_felled={report.get('tree_felled')}")
-                if self.action_type in ("LOOT_CLUSTER", "GATHER_PATCH"):
+                if self.action_type in ("LOOT_CLUSTER", "GATHER_PATCH", "COLLECT_AREA"):
                     picked = report.get("picked_count", 0)
                     success = success and isinstance(picked, int) and picked > 0
                     self.events.append(f"{self.action_type.lower()} result id={self.action_id} "
@@ -202,14 +203,14 @@ class SurvivalPlanner:
                                        f"end={report.get('cluster_end_reason')}")
                     if isinstance(picked, int) and picked > 0:
                         self.picked_items += picked
-                        if self.action_type == "LOOT_CLUSTER" and self.loot_cluster is not None:
-                            self.loot_cluster["collected"] += picked
-                    if self.action_type == "LOOT_CLUSTER":
-                        self._end_cluster(report.get("cluster_end_reason") or "UNKNOWN")
+                        if self.action_type == "COLLECT_AREA" and self.collect_area is not None:
+                            self.collect_area["collected"] += picked
+                    if self.action_type == "COLLECT_AREA":
+                        self._end_area(report.get("cluster_end_reason") or "UNKNOWN")
                 self._finish(success, status)
             elif (self.action_started_at is not None
                   and time.monotonic() - self.action_started_at > (
-                      50 if self.action_type in ("LOOT_CLUSTER", "GATHER_PATCH") else
+                      50 if self.action_type in ("LOOT_CLUSTER", "GATHER_PATCH", "COLLECT_AREA") else
                       35 if self.action_type == "FELL_TREE" else 12)):
                 self._finish(False, "lost_action_report")
             else:
@@ -217,6 +218,7 @@ class SurvivalPlanner:
                 if (threat is True and not self.action_escape
                         and self.action_type in ("PICK_TARGET", "PICKUP_TARGET",
                                                  "FELL_TREE", "LOOT_CLUSTER", "GATHER_PATCH",
+                                                 "COLLECT_AREA",
                                                  "MOVE_TO_TARGET",
                                                  "MOVE_TO_POINT", "BUILD_CAMPFIRE",
                                                  "COOK_AT", "ADD_FUEL")):
@@ -236,6 +238,7 @@ class SurvivalPlanner:
                         and (inventory.get("counts") or {}).get("torch", 0) > 0
                         and self.action_type in ("PICK_TARGET", "PICKUP_TARGET",
                                                  "FELL_TREE", "LOOT_CLUSTER", "GATHER_PATCH",
+                                                 "COLLECT_AREA",
                                                  "MOVE_TO_TARGET",
                                                  "MOVE_TO_POINT", "BUILD_CAMPFIRE",
                                                  "COOK_AT", "ADD_FUEL")
@@ -295,10 +298,13 @@ class SurvivalPlanner:
                 self.blocked_cells.add(self._cell(*self.action_point))
         if status == "interrupted_threat" and self.action_target is not None:
             self.avoid_targets[self.action_target] = time.monotonic() + 20
-        if status in ("interrupted_threat", "interrupted_light", "stopped") and self.loot_cluster:
-            self._end_cluster("SAFETY_INTERRUPT")
-        if self.action_type == "LOOT_CLUSTER" and self.loot_cluster is not None:
-            self._end_cluster(status.upper())
+        if status in ("interrupted_threat", "interrupted_light", "stopped") and self.collect_area:
+            self._end_area("SAFETY_INTERRUPT")
+        if self.action_type == "COLLECT_AREA" and self.collect_area is not None:
+            self._end_area(status.upper())
+        if (self.action_type == "MOVE_TO_TARGET" and not success
+                and self.collect_area is not None):
+            self._end_area(status.upper())
         self.events.append(f"action id={self.action_id} behavior={self.action_behavior_id} "
                            f"status={status} success={success}")
         self.reason = status
@@ -311,88 +317,60 @@ class SurvivalPlanner:
         self.action_behavior_id = None
         self.stop_requested = False
 
-    def _end_cluster(self, reason):
-        if self.loot_cluster is not None:
-            self.events.append(f"loot_cluster id={self.loot_cluster['id']} end={reason} "
-                               f"collected={self.loot_cluster['collected']}")
-            self.loot_cluster = None
+    def _end_area(self, reason):
+        if self.collect_area is not None:
+            self.events.append(f"collect_area id={self.collect_area['id']} end={reason} "
+                               f"collected={self.collect_area['collected']}")
+            self.collect_area = None
 
-    def _choose_cluster(self, observation, counts, free_slots, now):
-        cluster = self.loot_cluster
-        if cluster is None:
+    def _continue_area(self, observation, free_slots, now):
+        area = self.collect_area
+        if area is None:
             return None
         if free_slots <= 0:
-            self._end_cluster("INVENTORY_LIMIT")
+            self._end_area("INVENTORY_LIMIT")
             return None
-        if cluster["collected"] >= 12 or now - cluster["started_at"] >= 60:
-            self._end_cluster("TASK_BUDGET_REACHED")
+        if now - area["started_at"] >= 60:
+            self._end_area("TASK_BUDGET_REACHED")
             return None
-        nearby = []
-        rejected = []
-        for entity in observation.get("local_entities") or []:
-            if entity.get("kind") != "pickup" or entity.get("ready") is not True:
-                continue
-            dx, dz = entity.get("dx"), entity.get("dz")
-            if not isinstance(dx, (int, float)) or not isinstance(dz, (int, float)):
-                continue
-            world_x, world_z = observation["x"] + dx, observation["z"] + dz
-            if (world_x - cluster["x"]) ** 2 + (world_z - cluster["z"]) ** 2 > 36:
-                continue
-            distance = (dx * dx + dz * dz) ** 0.5
-            if self._route_near_frog(observation, entity):
-                rejected.append(f"{entity.get('prefab')}:{entity.get('guid')}=UNSAFE_FROG_ROUTE")
-                continue
-            offer = loose_item_offer(entity.get("prefab"),
-                                     counts.get(entity.get("prefab"), 0),
-                                     free_slots, distance)
-            if offer is not None and self.avoid_targets.get(entity.get("guid"), 0) <= now:
-                nearby.append((-(offer[0] - 0.7 * distance), distance,
-                               entity["guid"], entity))
-            else:
-                prefab = entity.get("prefab")
-                desired = ITEM_CATALOG.get(prefab, (None, 1, 1, 3))[1]
-                reason = ("RECENT_FAILURE_COOLDOWN"
-                          if self.avoid_targets.get(entity.get("guid"), 0) > now else
-                          "RESOURCE_ALREADY_SUFFICIENT"
-                          if counts.get(prefab, 0) >= desired else
-                          "INVENTORY_PRESSURE" if free_slots <= 3 else
-                          "OUTSIDE_ALLOWED_RADIUS")
-                rejected.append(f"{prefab}:{entity['guid']}={reason}")
-        if not nearby:
-            self.events.append(f"loot_cluster id={cluster['id']} "
-                               f"rejected=[{', '.join(rejected[:8])}]")
-            self._end_cluster("CLUSTER_EXHAUSTED")
+        visible = {item.get("guid"): item for item in observation.get("local_entities") or []
+                   if item.get("ready") is True}
+        available = []
+        for entry in area["items"]:
+            item = visible.get(entry["guid"])
+            if (item is not None and item.get("prefab") == entry["prefab"]
+                    and item.get("kind") == entry["kind"]
+                    and self.avoid_targets.get(entry["guid"], 0) <= now
+                    and not self._route_near_frog(observation, item)):
+                available.append(item)
+        if not available:
+            self._end_area("AREA_EXHAUSTED")
             return None
-        _, distance, _, target = min(nearby)
-        self.decision_seq += 1
-        self.events.append(f"decision={self.decision_seq} behavior={cluster['id']} "
-                           f"cluster_next={target['prefab']}:{target['guid']} "
-                           f"options={len(nearby)} free_slots={free_slots}")
-        if distance > 8:
-            return self._resource_choice("loot", target, observation,
-                                         behavior_id=cluster["id"])
-        planned = dict(counts)
-        items = []
-        for _, item_distance, _, item in sorted(nearby):
-            if item_distance > 16:
-                continue
-            prefab = item["prefab"]
-            if loose_item_offer(prefab, planned.get(prefab, 0),
-                                free_slots, item_distance) is None:
-                continue
-            items.append({"guid": item["guid"], "prefab": prefab})
-            planned[prefab] = planned.get(prefab, 0) + 1
-            if len(items) >= 12:
-                break
-        if not items:
-            self._end_cluster("CLUSTER_EXHAUSTED")
-            return None
-        self.events.append(f"loot_cluster id={cluster['id']} batch=["
+        ordered = []
+        point = (0, 0)
+        while available and len(ordered) < 12:
+            item = min(available, key=lambda current:
+                       ((current["dx"] - point[0]) ** 2
+                        + (current["dz"] - point[1]) ** 2, current["guid"]))
+            ordered.append(item)
+            available.remove(item)
+            point = (item["dx"], item["dz"])
+        first = ordered[0]
+        distance_sq = first["dx"] ** 2 + first["dz"] ** 2
+        if distance_sq > 64:
+            self.events.append(f"collect_area id={area['id']} approach="
+                               f"{first['prefab']}:{first['guid']} members={len(ordered)}")
+            return {"type": "MOVE_TO_TARGET", "target_guid": first["guid"],
+                    "target_prefab": first["prefab"], "behavior_id": area["id"],
+                    "goal": area["goal"], "say": "看到一片有用的资源，我过去收集"}
+        items = [{"guid": item["guid"], "prefab": item["prefab"],
+                  "kind": item["kind"]} for item in ordered]
+        self.events.append(f"collect_area id={area['id']} batch=["
                            + ",".join(f"{item['prefab']}:{item['guid']}" for item in items)
                            + "]")
-        return {"type": "LOOT_CLUSTER", "items": items,
-                "target_guid": items[0]["guid"], "behavior_id": cluster["id"],
-                "goal": "stockpile", "say": "附近有一堆有用的物资，我捡齐"}
+        return {"type": "COLLECT_AREA", "items": items,
+                "target_guid": first["guid"], "behavior_id": area["id"],
+                "goal": area["goal"], "say": "这一片有用的东西，我一起收集"}
 
     @staticmethod
     def _cell(x, z):
@@ -596,13 +574,13 @@ class SurvivalPlanner:
 
         nearby = observation.get("local_entities") or []
         now = time.monotonic()
-        if self.loot_cluster is not None:
+        if self.collect_area is not None:
             if critical_hunger or night_imminent or phase == "night":
-                self._end_cluster("SURVIVAL_INTERRUPT")
+                self._end_area("SURVIVAL_INTERRUPT")
             else:
-                cluster_choice = self._choose_cluster(observation, counts, free_slots, now)
-                if cluster_choice is not None:
-                    return cluster_choice
+                area_choice = self._continue_area(observation, free_slots, now)
+                if area_choice is not None:
+                    return area_choice
         can_cook = (phase == "day" and observation.get("cycles", 0) >= 1
                     and not light_needed and morsels > 0 and grass >= 7
                     and twigs >= 4 and health >= 90 and hunger > 50 * hunger_scale
@@ -730,19 +708,7 @@ class SurvivalPlanner:
                                ("berrybush", "berrybush2", "berrybush_juicy") else 0)
                 near_bonus = (0 if critical_hunger and resource != "food" else
                               8 if distance_sq <= 36 else 0)
-                patch_bonus = 0
-                if target.get("kind") == "harvest" and not (critical_hunger and resource != "food"):
-                    patch_size = sum(1 for item in nearby
-                                     if item.get("kind") == "harvest"
-                                     and item.get("prefab") == target["prefab"]
-                                     and item.get("ready") is True
-                                     and self.avoid_targets.get(item.get("guid"), 0) <= now
-                                     and (item.get("dx", 99) - target["dx"]) ** 2
-                                     + (item.get("dz", 99) - target["dz"]) ** 2 <= 36
-                                     and item.get("dx", 99) ** 2 + item.get("dz", 99) ** 2 <= 144
-                                     and not self._route_near_frog(observation, item))
-                    patch_bonus = 3 * min(3, max(0, patch_size - 1))
-                score = priority + value_bonus + near_bonus + patch_bonus - 0.7 * distance
+                score = priority + value_bonus + near_bonus - 0.7 * distance
                 candidates.append((-score, distance_sq, target["guid"], resource, target))
             if target.get("kind") == "pickup" and not matched:
                 offer = loose_item_offer(target.get("prefab"),
@@ -760,62 +726,55 @@ class SurvivalPlanner:
                         "INVENTORY_PRESSURE" if free_slots <= 3 else
                         "OUTSIDE_ALLOWED_RADIUS"))
         if candidates:
-            _, _, _, resource, target = min(candidates)
             top = sorted(candidates)[:5]
             self.decision_seq += 1
             top_text = ", ".join(
                 f"{row[4]['prefab']}:{row[2]}:{-row[0]:.1f}" for row in top)
+            area_options = []
+            if phase != "night" and not night_imminent and free_slots > 0:
+                collectible = [row for row in sorted(candidates)
+                               if row[4].get("kind") in ("harvest", "pickup")
+                               and (not critical_hunger or row[3] == "food")]
+                seen = set()
+                for seed in collectible:
+                    center = seed[4]
+                    if center["dx"] ** 2 + center["dz"] ** 2 > 256:
+                        continue
+                    members = [row for row in collectible
+                               if (row[4]["dx"] - center["dx"]) ** 2
+                               + (row[4]["dz"] - center["dz"]) ** 2 <= 36
+                               and row[4]["dx"] ** 2 + row[4]["dz"] ** 2 <= 484]
+                    members = members[:12]
+                    key = frozenset(row[2] for row in members)
+                    if len(key) < 2 or key in seen:
+                        continue
+                    seen.add(key)
+                    best = min(members)
+                    area_score = -best[0] + 3 * min(len(members) - 1, 5)
+                    area_options.append((-area_score, best[1], best[2], members))
+            best_area = min(area_options, key=lambda row: row[:3]) if area_options else None
+            if best_area and best_area[:3] < min(candidates)[:3]:
+                _, _, _, members = best_area
+                self.behavior_seq += 1
+                area_id = f"area-{self.behavior_seq}"
+                self.collect_area = {
+                    "id": area_id, "goal": "food" if critical_hunger else "stockpile",
+                    "items": [{"guid": row[4]["guid"], "prefab": row[4]["prefab"],
+                               "kind": row[4]["kind"]} for row in members],
+                    "collected": 0, "started_at": now,
+                }
+                self.events.append(
+                    f"decision={self.decision_seq} chosen=collect_area:{area_id} "
+                    f"score={-best_area[0]:.1f} "
+                    f"members=[{','.join(str(item['guid']) for item in self.collect_area['items'])}] "
+                    f"top=[{top_text}] rejected=[{', '.join(rejected[:8])}] "
+                    f"free_slots={free_slots}")
+                return self._continue_area(observation, free_slots, now)
+            _, _, _, resource, target = min(candidates)
             self.events.append(
                 f"decision={self.decision_seq} chosen={target['prefab']}:{target['guid']} "
                 f"top=[{top_text}] "
                 f"rejected=[{', '.join(rejected[:8])}] free_slots={free_slots}")
-            if (target.get("kind") == "harvest"
-                    and target["dx"] ** 2 + target["dz"] ** 2 <= 64
-                    and free_slots > 0):
-                members = [item for item in nearby
-                           if item.get("kind") == "harvest" and item.get("ready") is True
-                           and item.get("prefab") == target["prefab"]
-                           and self.avoid_targets.get(item.get("guid"), 0) <= now
-                           and (item.get("dx", 99) - target["dx"]) ** 2
-                           + (item.get("dz", 99) - target["dz"]) ** 2 <= 36
-                           and item.get("dx", 99) ** 2 + item.get("dz", 99) ** 2 <= 144
-                           and not self._route_near_frog(observation, item)]
-                if len(members) >= 2:
-                    others = sorted((item for item in members
-                                     if item["guid"] != target["guid"]),
-                                    key=lambda item: ((item["dx"] - target["dx"]) ** 2
-                                                      + (item["dz"] - target["dz"]) ** 2,
-                                                      item["guid"]))
-                    items = [{"guid": item["guid"], "prefab": item["prefab"]}
-                             for item in [target, *others[:7]]]
-                    self.behavior_seq += 1
-                    behavior_id = f"patch-{self.behavior_seq}"
-                    self.events.append(f"gather_patch id={behavior_id} batch=["
-                                       + ",".join(f"{item['prefab']}:{item['guid']}"
-                                                  for item in items) + "]")
-                    goal = "food" if resource == "food" else "light"
-                    return {"type": "GATHER_PATCH", "items": items,
-                            "target_guid": target["guid"],
-                            "behavior_id": behavior_id, "goal": goal,
-                            "say": "这片有用的资源，我顺手采完"}
-            if (target.get("kind") == "pickup" and phase != "night"
-                    and not critical_hunger and not night_imminent):
-                x, z = observation.get("x"), observation.get("z")
-                if isinstance(x, (int, float)) and isinstance(z, (int, float)):
-                    center_x, center_z = x + target["dx"], z + target["dz"]
-                    members = [item for item in nearby
-                               if item.get("kind") == "pickup" and item.get("ready") is True
-                               and (x + item["dx"] - center_x) ** 2
-                               + (z + item["dz"] - center_z) ** 2 <= 36]
-                    if len(members) >= 2:
-                        self.behavior_seq += 1
-                        self.loot_cluster = {"id": f"loot-{self.behavior_seq}",
-                                             "x": center_x, "z": center_z,
-                                             "collected": 0, "started_at": now}
-                        self.events.append(f"loot_cluster id={self.loot_cluster['id']} "
-                                           f"start={target['prefab']}:{target['guid']} "
-                                           f"observed_members={len(members)}")
-                        return self._choose_cluster(observation, counts, free_slots, now)
             choice = self._resource_choice(resource, target, observation)
             if choice["type"] == "FELL_TREE":
                 self.behavior_seq += 1

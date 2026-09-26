@@ -1,6 +1,6 @@
 # P0 探针消息
 
-本协议定义本机状态交换、手动探针、0.7.0 的有限自主采集，以及 0.21.0 的连续首夜生存和第二天木头、营火与烹饪任务。完整首夜仍待真实游戏验收。
+本协议定义本机状态交换、手动探针、0.7.0 的有限自主采集，以及 0.22.0 的连续首夜生存和第二天木头、营火与烹饪任务。完整首夜仍待真实游戏验收。
 
 Lua 在 0.6.0 起每 1 游戏秒向 `http://127.0.0.1:8765/probe` 发送一次 POST JSON；正常回执日志每 10 条采样一次，失败和动作变化仍单独记录：
 
@@ -61,3 +61,5 @@ Lua 只接受 `probe`、`seq`、`ack` 全部匹配的回执，并将结果写入
 0.20.0 将 `loot_cluster` 的近处拾取合并为一条 `LOOT_CLUSTER` 命令，携带至多 12 个目标 GUID 与 prefab；Lua 连续执行 `PICKUP`，最多 45 游戏秒，逐件验证库存增量，并在终态回报 `picked_count`、总 `inventory_delta` 与 `cluster_end_reason`（如 `CLUSTER_EXHAUSTED`、`INVENTORY_LIMIT`、`SAFETY_INTERRUPT`、`TASK_BUDGET_REACHED`）。远处物资组先用同一行为 ID 接近，再启动这条命令。实机效果待验证。
 
 0.21.0 的 `GATHER_PATCH` 同样携带一组目标，针对近处同类可采植物连续执行 `PICK`。`PICK_TARGET`、`PICKUP_TARGET`、`FELL_TREE`、`LOOT_CLUSTER` 和 `GATHER_PATCH` 在远于交互距离时，先由 Lua 控制接近，再衔接原生动作；客户端移动预览只覆盖接近阶段。批次内不逐株交还 Python 重新评分。
+
+0.22.0 将同一空间内当前值得收集的可采植物和地面物品组成 `collect_area` 行为，至多 12 件。距离较远时沿用同一行为 ID 先接近，再发送一条 `COLLECT_AREA` 命令；每项附 `kind=harvest|pickup`，Lua 对应执行 `PICK` 或 `PICKUP`，逐项确认背包增量。整片完成或安全中断后才重新规划。`LOOT_CLUSTER` 和 `GATHER_PATCH` 仍可由 Lua 识别，当前规划器使用 `COLLECT_AREA`。
