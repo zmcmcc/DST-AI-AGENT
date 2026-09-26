@@ -530,7 +530,14 @@ AddPlayerPostInit(function(inst)
             .. " remaining=" .. G.tostring(move.distance_to_goal))
     end
 
-    local function StartPickPreview(pick, target)
+    local function StopPickPreview(pick)
+        if pick.preview_id ~= nil then
+            SendClientMove("move_stop", pick.epoch, pick.preview_id)
+            pick.preview_id = nil
+        end
+    end
+
+    local function StartPickPreview(pick, target, preview_id)
         if inst:GetDistanceSqToInst(target) <= 4 then
             return
         end
@@ -539,7 +546,7 @@ AddPlayerPostInit(function(inst)
         local dx, dz = px - tx, pz - tz
         local length = G.math.sqrt(dx * dx + dz * dz)
         if length > 0.01 then
-            pick.preview_id = pick.id
+            pick.preview_id = preview_id or pick.id
             SendClientMove("move_start", pick.epoch, pick.preview_id,
                 tx + dx / length, tz + dz / length)
         end
@@ -549,8 +556,14 @@ AddPlayerPostInit(function(inst)
         if active_pick == pick then
             if status ~= "started" and status ~= "received"
                 and pick.preview_id ~= nil then
-                SendClientMove("move_stop", pick.epoch, pick.preview_id)
-                pick.preview_id = nil
+                StopPickPreview(pick)
+            end
+            if pick.type == "LOOT_CLUSTER" and status ~= "started"
+                and status ~= "received" and pick.cluster_end_reason == nil then
+                pick.cluster_end_reason = status == "interrupted_threat"
+                    and "SAFETY_INTERRUPT" or status == "interrupted_light"
+                    and "LIGHT_INTERRUPT" or status == "stopped"
+                    and "STOPPED" or status
             end
             pick.status = status
             command_ack = {epoch = pick.epoch, id = pick.id, status = status}
@@ -905,6 +918,129 @@ AddPlayerPostInit(function(inst)
         end)
     end
 
+    local function StartLootCluster(command)
+        if (active_pick ~= nil and active_pick.status == "started")
+            or (active_move ~= nil and active_move.status == "started")
+            or (active_utility ~= nil and active_utility.status == "started") then
+            command_ack = {epoch = command.epoch, id = command.id, status = "rejected_busy"}
+            return
+        end
+        local items = command.items
+        local cluster = {
+            epoch = command.epoch,
+            id = command.id,
+            type = "LOOT_CLUSTER",
+            target_guid = items[1].guid,
+            status = "received",
+            inventory_delta = 0,
+            picked_count = 0,
+            index = 0,
+        }
+        active_pick = cluster
+        local inventory = inst.components.inventory
+        local locomotor = inst.components.locomotor
+        if inst:HasTag("playerghost") or inventory == nil or locomotor == nil then
+            SetPickStatus(cluster, "rejected_unavailable")
+            return
+        end
+        if HasVisibleThreat(inst, SENSE_RADIUS) then
+            SetPickStatus(cluster, "rejected_threat_nearby")
+            return
+        end
+        local function finish(reason, status)
+            if active_pick == cluster and cluster.status == "started" then
+                cluster.cluster_end_reason = reason
+                SetPickStatus(cluster, status or
+                    (cluster.picked_count > 0 and "completed" or "empty_cluster"))
+            end
+        end
+        local next_pick
+        next_pick = function()
+            if active_pick ~= cluster or cluster.status ~= "started" then
+                return
+            end
+            if HasVisibleThreat(inst, SENSE_RADIUS) then
+                finish("SAFETY_INTERRUPT", "interrupted_threat")
+                return
+            end
+            if inventory:IsFull() then
+                finish("INVENTORY_LIMIT", cluster.picked_count > 0
+                    and "completed" or "rejected_inventory")
+                return
+            end
+            local entry, target
+            while cluster.index < #items do
+                cluster.index = cluster.index + 1
+                local candidate = items[cluster.index]
+                local entity = G.Ents[candidate.guid]
+                if entity ~= nil and entity:IsValid()
+                    and entity.prefab == candidate.prefab
+                    and entity.components.inventoryitem ~= nil
+                    and entity.components.inventoryitem.owner == nil
+                    and entity.components.inventoryitem.canbepickedup
+                    and G.CanEntitySeeTarget(inst, entity)
+                    and inst:GetDistanceSqToInst(entity) <= 256 then
+                    entry, target = candidate, entity
+                    break
+                end
+                G.print("[Wilson P0] cluster id=" .. cluster.id
+                    .. " skipped target=" .. G.tostring(candidate.guid))
+            end
+            if target == nil then
+                finish("CLUSTER_EXHAUSTED")
+                return
+            end
+            cluster.target_guid = entry.guid
+            local before = CountInventoryItem(inst, entry.prefab)
+            local action = G.BufferedAction(inst, target, G.ACTIONS.PICKUP)
+            cluster.action = action
+            action:AddSuccessAction(function()
+                if cluster.status ~= "started" then
+                    return
+                end
+                local delta = CountInventoryItem(inst, entry.prefab) - before
+                if delta > 0 then
+                    cluster.inventory_delta = cluster.inventory_delta + delta
+                    cluster.picked_count = cluster.picked_count + 1
+                    G.print("[Wilson P0] cluster id=" .. cluster.id
+                        .. " picked=" .. entry.prefab .. ":" .. entry.guid
+                        .. " total=" .. cluster.picked_count)
+                end
+                StopPickPreview(cluster)
+                inst:DoTaskInTime(0, next_pick)
+            end)
+            action:AddFailAction(function()
+                if cluster.status == "started" then
+                    StopPickPreview(cluster)
+                    G.print("[Wilson P0] cluster id=" .. cluster.id
+                        .. " failed target=" .. entry.guid)
+                    inst:DoTaskInTime(0, next_pick)
+                end
+            end)
+            local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
+            if ok then
+                StartPickPreview(cluster, target, command.id * 100 + cluster.index)
+            else
+                inst:DoTaskInTime(0, next_pick)
+            end
+        end
+        SetPickStatus(cluster, "started")
+        SayIntent(command, "我把附近的物资捡起来")
+        next_pick()
+        inst:DoTaskInTime(45, function()
+            if inst:IsValid() and active_pick == cluster
+                and cluster.status == "started" then
+                if inst:GetBufferedAction() == cluster.action then
+                    inst:ClearBufferedAction()
+                    locomotor:Clear()
+                    locomotor:Stop()
+                end
+                finish("TASK_BUDGET_REACHED", cluster.picked_count > 0
+                    and "completed" or "timed_out")
+            end
+        end)
+    end
+
     local function StartFellTree(command)
         if (active_pick ~= nil and active_pick.status == "started")
             or (active_move ~= nil and active_move.status == "started")
@@ -1034,8 +1170,7 @@ AddPlayerPostInit(function(inst)
             local target = G.Ents[active_pick.target_guid]
             if target == nil or not target:IsValid()
                 or inst:GetDistanceSqToInst(target) <= 4 then
-                SendClientMove("move_stop", active_pick.epoch, active_pick.preview_id)
-                active_pick.preview_id = nil
+                StopPickPreview(active_pick)
             end
         end
         if survival_seen and (night_soon or dark_now or replace_now) and inventory ~= nil
@@ -1052,7 +1187,8 @@ AddPlayerPostInit(function(inst)
                     FinishMove(active_move, "interrupted_light")
                 elseif not replace_now and active_pick ~= nil and active_pick.status == "started"
                     and locomotor ~= nil and (inst:GetBufferedAction() == active_pick.action
-                        or active_pick.type == "FELL_TREE") then
+                        or active_pick.type == "FELL_TREE"
+                        or active_pick.type == "LOOT_CLUSTER") then
                     if inst:GetBufferedAction() == active_pick.action then
                         inst:ClearBufferedAction()
                         locomotor:Clear()
@@ -1083,7 +1219,8 @@ AddPlayerPostInit(function(inst)
                 SayIntent({}, "附近有危险，我先停下")
             elseif active_pick ~= nil and active_pick.status == "started"
                 and (inst:GetBufferedAction() == active_pick.action
-                    or active_pick.type == "FELL_TREE") then
+                    or active_pick.type == "FELL_TREE"
+                    or active_pick.type == "LOOT_CLUSTER") then
                 if inst:GetBufferedAction() == active_pick.action then
                     inst:ClearBufferedAction()
                     locomotor:Clear()
@@ -1201,7 +1338,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.19.0",
+            mod_version = "0.20.0",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,
@@ -1235,6 +1372,8 @@ AddPlayerPostInit(function(inst)
                 target_guid = active_pick.target_guid,
                 status = active_pick.status,
                 inventory_delta = active_pick.inventory_delta,
+                picked_count = active_pick.picked_count,
+                cluster_end_reason = active_pick.cluster_end_reason,
                 work_delta = active_pick.work_delta,
                 tree_felled = active_pick.tree_felled,
             } or nil,
@@ -1419,6 +1558,14 @@ AddPlayerPostInit(function(inst)
                     and key ~= last_command_key then
                     last_command_key = key
                     StartPickup(command)
+                elseif command.type == "LOOT_CLUSTER" and command.guid == inst.GUID
+                    and G.type(command.epoch) == "string" and G.type(command.id) == "number"
+                    and G.type(command.items) == "table" and #command.items >= 1
+                    and #command.items <= 12 and G.type(command.items[1]) == "table"
+                    and G.type(command.items[1].guid) == "number"
+                    and key ~= last_command_key then
+                    last_command_key = key
+                    StartLootCluster(command)
                 elseif command.type == "FELL_TREE" and command.guid == inst.GUID
                     and G.type(command.epoch) == "string" and G.type(command.id) == "number"
                     and G.type(command.target_guid) == "number"
@@ -1472,7 +1619,8 @@ AddPlayerPostInit(function(inst)
                             locomotor:Clear()
                             locomotor:Stop()
                             status = "stopped_pick"
-                        elseif active_pick.type == "FELL_TREE" then
+                        elseif active_pick.type == "FELL_TREE"
+                            or active_pick.type == "LOOT_CLUSTER" then
                             SetPickStatus(active_pick, "stopped")
                             status = "stopped_pick"
                         else

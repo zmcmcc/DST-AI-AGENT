@@ -12,6 +12,7 @@ from item_catalog import ITEM_CATALOG, loose_item_offer
 TERMINAL_SUCCESS = {
     "PICK_TARGET": {"completed"},
     "PICKUP_TARGET": {"completed"},
+    "LOOT_CLUSTER": {"completed"},
     "FELL_TREE": {"completed"},
     "MOVE_TO_TARGET": {"arrived"},
     "MOVE_TO_POINT": {"arrived"},
@@ -70,6 +71,7 @@ class SurvivalPlanner:
         self.stop_requested = False
         self.completed = 0
         self.failed = 0
+        self.picked_items = 0
         self.saw_night = False
         self.night_light_samples = 0
         self.night_dark_samples = 0
@@ -102,6 +104,7 @@ class SurvivalPlanner:
             "loot_cluster": self.loot_cluster,
             "completed": self.completed,
             "failed": self.failed,
+            "picked_items": self.picked_items,
             "explored_cells": len(self.visits),
             "observed_cells": len(self.seen_cells),
             "resources_discovered": len(self.seen_resources),
@@ -164,7 +167,7 @@ class SurvivalPlanner:
         if self.action_id is not None:
             report_name = ("movement" if self.action_type.startswith("MOVE_") else
                            "execution" if self.action_type in ("PICK_TARGET", "PICKUP_TARGET",
-                                                               "FELL_TREE") else "utility")
+                                                               "FELL_TREE", "LOOT_CLUSTER") else "utility")
             report = observation.get(report_name) or {}
             ack = observation.get("command_ack") or {}
             status = None
@@ -188,16 +191,28 @@ class SurvivalPlanner:
                     self.events.append(f"fell_tree target={self.action_target} "
                                        f"work_delta={report.get('work_delta')} "
                                        f"tree_felled={report.get('tree_felled')}")
+                if self.action_type == "LOOT_CLUSTER":
+                    picked = report.get("picked_count", 0)
+                    success = success and isinstance(picked, int) and picked > 0
+                    self.events.append(f"loot_cluster result id={self.action_id} "
+                                       f"picked={picked} delta={report.get('inventory_delta')} "
+                                       f"end={report.get('cluster_end_reason')}")
+                    if isinstance(picked, int) and picked > 0:
+                        self.picked_items += picked
+                        if self.loot_cluster is not None:
+                            self.loot_cluster["collected"] += picked
+                    self._end_cluster(report.get("cluster_end_reason") or "UNKNOWN")
                 self._finish(success, status)
             elif (self.action_started_at is not None
                   and time.monotonic() - self.action_started_at > (
+                      50 if self.action_type == "LOOT_CLUSTER" else
                       35 if self.action_type == "FELL_TREE" else 12)):
                 self._finish(False, "lost_action_report")
             else:
                 threat = observation.get("visible_threat_within_8")
                 if (threat is True and not self.action_escape
                         and self.action_type in ("PICK_TARGET", "PICKUP_TARGET",
-                                                 "FELL_TREE", "MOVE_TO_TARGET",
+                                                 "FELL_TREE", "LOOT_CLUSTER", "MOVE_TO_TARGET",
                                                  "MOVE_TO_POINT", "BUILD_CAMPFIRE",
                                                  "COOK_AT", "ADD_FUEL")):
                     if not self.stop_requested:
@@ -215,7 +230,7 @@ class SurvivalPlanner:
                 if (light_deadline and inventory.get("hand") != "torch"
                         and (inventory.get("counts") or {}).get("torch", 0) > 0
                         and self.action_type in ("PICK_TARGET", "PICKUP_TARGET",
-                                                 "FELL_TREE", "MOVE_TO_TARGET",
+                                                 "FELL_TREE", "LOOT_CLUSTER", "MOVE_TO_TARGET",
                                                  "MOVE_TO_POINT", "BUILD_CAMPFIRE",
                                                  "COOK_AT", "ADD_FUEL")
                         and not self.stop_requested):
@@ -256,9 +271,6 @@ class SurvivalPlanner:
     def _finish(self, success, status):
         if success:
             self.completed += 1
-            if (self.action_type == "PICKUP_TARGET" and self.loot_cluster is not None
-                    and self.action_behavior_id == self.loot_cluster["id"]):
-                self.loot_cluster["collected"] += 1
             if self.action_type == "MOVE_TO_POINT" and self.action_point is not None:
                 self._mark_visit(*self.action_point)
         elif status not in ("stopped", "interrupted_threat", "interrupted_light"):
@@ -277,6 +289,8 @@ class SurvivalPlanner:
                 self.blocked_cells.add(self._cell(*self.action_point))
         if status in ("interrupted_threat", "interrupted_light", "stopped") and self.loot_cluster:
             self._end_cluster("SAFETY_INTERRUPT")
+        if self.action_type == "LOOT_CLUSTER" and self.loot_cluster is not None:
+            self._end_cluster(status.upper())
         self.events.append(f"action id={self.action_id} behavior={self.action_behavior_id} "
                            f"status={status} success={success}")
         self.reason = status
@@ -302,7 +316,7 @@ class SurvivalPlanner:
         if free_slots <= 0:
             self._end_cluster("INVENTORY_LIMIT")
             return None
-        if cluster["collected"] >= 12 or now - cluster["started_at"] >= 30:
+        if cluster["collected"] >= 12 or now - cluster["started_at"] >= 60:
             self._end_cluster("TASK_BUDGET_REACHED")
             return None
         nearby = []
@@ -338,13 +352,36 @@ class SurvivalPlanner:
                                f"rejected=[{', '.join(rejected[:8])}]")
             self._end_cluster("CLUSTER_EXHAUSTED")
             return None
-        _, _, _, target = min(nearby)
+        _, distance, _, target = min(nearby)
         self.decision_seq += 1
         self.events.append(f"decision={self.decision_seq} behavior={cluster['id']} "
                            f"cluster_next={target['prefab']}:{target['guid']} "
                            f"options={len(nearby)} free_slots={free_slots}")
-        return self._resource_choice("loot", target, observation,
-                                     behavior_id=cluster["id"])
+        if distance > 8:
+            return self._resource_choice("loot", target, observation,
+                                         behavior_id=cluster["id"])
+        planned = dict(counts)
+        items = []
+        for _, item_distance, _, item in sorted(nearby):
+            if item_distance > 16:
+                continue
+            prefab = item["prefab"]
+            if loose_item_offer(prefab, planned.get(prefab, 0),
+                                free_slots, item_distance) is None:
+                continue
+            items.append({"guid": item["guid"], "prefab": prefab})
+            planned[prefab] = planned.get(prefab, 0) + 1
+            if len(items) >= 12:
+                break
+        if not items:
+            self._end_cluster("CLUSTER_EXHAUSTED")
+            return None
+        self.events.append(f"loot_cluster id={cluster['id']} batch=["
+                           + ",".join(f"{item['prefab']}:{item['guid']}" for item in items)
+                           + "]")
+        return {"type": "LOOT_CLUSTER", "items": items,
+                "target_guid": items[0]["guid"], "behavior_id": cluster["id"],
+                "goal": "stockpile", "say": "附近有一堆有用的物资，我捡齐"}
 
     @staticmethod
     def _cell(x, z):
@@ -690,8 +727,7 @@ class SurvivalPlanner:
                         self.events.append(f"loot_cluster id={self.loot_cluster['id']} "
                                            f"start={target['prefab']}:{target['guid']} "
                                            f"observed_members={len(members)}")
-                        return self._resource_choice(resource, target, observation,
-                                                     behavior_id=self.loot_cluster["id"])
+                        return self._choose_cluster(observation, counts, free_slots, now)
             choice = self._resource_choice(resource, target, observation)
             if choice["type"] == "FELL_TREE":
                 self.behavior_seq += 1

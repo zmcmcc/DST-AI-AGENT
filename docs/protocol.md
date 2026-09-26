@@ -1,6 +1,6 @@
 # P0 探针消息
 
-本协议定义本机状态交换、手动探针、0.7.0 的有限自主采集，以及 0.19.0 的连续首夜生存和第二天木头、营火与烹饪任务。完整首夜仍待真实游戏验收。
+本协议定义本机状态交换、手动探针、0.7.0 的有限自主采集，以及 0.20.0 的连续首夜生存和第二天木头、营火与烹饪任务。完整首夜仍待真实游戏验收。
 
 Lua 在 0.6.0 起每 1 游戏秒向 `http://127.0.0.1:8765/probe` 发送一次 POST JSON；正常回执日志每 10 条采样一次，失败和动作变化仍单独记录：
 
@@ -55,3 +55,5 @@ Lua 只接受 `probe`、`seq`、`ack` 全部匹配的回执，并将结果写入
 0.18.0 探索候选增加约 18 单位的长路段和 6 单位的受阻回退候选，目标移动按距离延长时间；路过近处的地面物品可中断探索去拾取。观察中的地面物品依据 `inventoryitem` 组件发现，`inventory.counts` 汇总全部背包物品，`inventory.free_slots` 提供空格数。常见物品优先级集中在 `probe/item_catalog.py`，未知可拾取物品允许近处收集。夜间持有足够燃料的火炬时继续探索，照明余量不足时守在已有光源处。Jev 接入讨论见 `docs/jev-integration-v0.md`。
 
 0.19.0 对 8 单位内的可采、可拾、可砍目标直接下发 `PICK_TARGET`、`PICKUP_TARGET`、`FELL_TREE`，由 DST 的 `BufferedAction` 与 locomotor 完成接近和交互；客户端保留走路预览。`FELL_TREE` 在一次命令中连续提交砍击，以 `tree_felled` 和累计 `work_delta` 确认倒树。Python 为一组 6 单位内地面物品保留 `loot_cluster` 行为 ID，在安全、库存、时间预算内逐件拾取；该行为仍由多条拾取命令构成。桥接日志在资源决策时记录 Top-5 分数、过滤原因和行为 ID。以上运行效果待实机验证。
+
+0.20.0 将 `loot_cluster` 的近处拾取合并为一条 `LOOT_CLUSTER` 命令，携带至多 12 个目标 GUID 与 prefab；Lua 连续执行 `PICKUP`，最多 45 游戏秒，逐件验证库存增量，并在终态回报 `picked_count`、总 `inventory_delta` 与 `cluster_end_reason`（如 `CLUSTER_EXHAUSTED`、`INVENTORY_LIMIT`、`SAFETY_INTERRUPT`、`TASK_BUDGET_REACHED`）。远处物资组先用同一行为 ID 接近，再启动这条命令。实机效果待验证。

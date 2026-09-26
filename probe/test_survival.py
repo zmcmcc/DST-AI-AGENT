@@ -503,7 +503,7 @@ class SurvivalPlannerTests(unittest.TestCase):
                 self.assertEqual(choice["type"], "PICKUP_TARGET")
                 self.assertEqual(choice["target_prefab"], prefab)
 
-    def test_loot_cluster_keeps_behavior_until_nearby_items_are_handled(self):
+    def test_loot_cluster_uses_one_command_for_nearby_items(self):
         planner = SurvivalPlanner()
         supplies = {"cutgrass": 8, "twigs": 8, "torch": 2}
         first = {"guid": 101, "prefab": "cutstone", "kind": "pickup",
@@ -517,18 +517,26 @@ class SurvivalPlannerTests(unittest.TestCase):
         before = observation(local_entities=[first, second, tool], inventory=inventory)
         planner.start(before)
         choice = planner.on_observation(before, "epoch")
-        self.assertEqual(choice["type"], "PICKUP_TARGET")
+        self.assertEqual(choice["type"], "LOOT_CLUSTER")
+        self.assertEqual({item["guid"] for item in choice["items"]}, {101, 102, 103})
         behavior_id = choice["behavior_id"]
         planner.record_command(1, choice)
-        after = observation(local_entities=[second, tool],
+        self.assertIsNone(planner.on_observation(observation(
+            local_entities=[first, second, tool], inventory=inventory,
+            execution={"epoch": "epoch", "id": 1,
+                       "status": "started", "picked_count": 1}), "epoch"))
+        after = observation(local_entities=[],
                             inventory={**inventory, "counts": {**supplies,
-                                       "cutstone": 1}, "free_slots": 9},
+                                       "cutstone": 2, "pickaxe": 1}, "free_slots": 8},
                             execution={"epoch": "epoch", "id": 1,
-                                       "status": "completed", "inventory_delta": 1})
-        choice = planner.on_observation(after, "epoch")
-        self.assertEqual(choice["type"], "PICKUP_TARGET")
-        self.assertEqual(choice["behavior_id"], behavior_id)
-        self.assertIn(choice["target_guid"], (102, 103))
+                                       "status": "completed", "inventory_delta": 3,
+                                       "picked_count": 3,
+                                       "cluster_end_reason": "CLUSTER_EXHAUSTED"})
+        planner.on_observation(after, "epoch")
+        self.assertIsNone(planner.loot_cluster)
+        self.assertEqual(planner.picked_items, 3)
+        self.assertTrue(any(behavior_id in event and "CLUSTER_EXHAUSTED" in event
+                            for event in planner.events))
         self.assertTrue(any("chosen=" in event and "top=[" in event
                             for event in planner.events))
 
@@ -552,8 +560,32 @@ class SurvivalPlannerTests(unittest.TestCase):
                               movement={"epoch": "epoch", "id": 1,
                                         "status": "arrived"})
         pickup = planner.on_observation(arrived, "epoch")
-        self.assertEqual(pickup["type"], "PICKUP_TARGET")
+        self.assertEqual(pickup["type"], "LOOT_CLUSTER")
         self.assertEqual(pickup["behavior_id"], approach["behavior_id"])
+
+    def test_loot_cluster_interruption_keeps_items_already_collected(self):
+        planner = SurvivalPlanner()
+        items = [{"guid": guid, "prefab": "cutstone", "kind": "pickup",
+                  "ready": True, "dx": guid - 110, "dz": 0}
+                 for guid in (111, 112)]
+        state = observation(local_entities=items,
+                            inventory={"counts": {"cutgrass": 8, "twigs": 8,
+                                                  "torch": 2}, "free_slots": 10,
+                                       "torch_ready_seconds": 150,
+                                       "food_ready_hunger": 75})
+        planner.start(state)
+        choice = planner.on_observation(state, "epoch")
+        self.assertEqual(choice["type"], "LOOT_CLUSTER")
+        planner.record_command(1, choice)
+        interrupted = observation(local_entities=[],
+            execution={"epoch": "epoch", "id": 1,
+                       "status": "interrupted_threat", "picked_count": 1,
+                       "inventory_delta": 1,
+                       "cluster_end_reason": "SAFETY_INTERRUPT"})
+        planner.on_observation(interrupted, "epoch")
+        self.assertEqual(planner.picked_items, 1)
+        self.assertIsNone(planner.loot_cluster)
+        self.assertEqual(planner.failed, 0)
 
     def test_long_walk_interrupts_to_collect_new_ground_loot(self):
         planner = SurvivalPlanner()

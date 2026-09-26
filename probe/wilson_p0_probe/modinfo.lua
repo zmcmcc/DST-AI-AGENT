@@ -1,7 +1,7 @@
 name = "Wilson Survival Agent (Test)"
 description = "Local first-night survival agent with spoken intent for a private test world."
 author = "Wilson Survival Agent"
-version = "0.19.0"
+version = "0.20.0"
 api_version = 10
 dst_compatible = true
 server_only_mod = false
