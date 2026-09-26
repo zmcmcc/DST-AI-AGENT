@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zhangmeng.wilson-survival-agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>-u</string>
+        <string>/Users/zhangmeng/.codex/projects/wilson-survival-agent/probe/bridge.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/zhangmeng/.codex/projects/wilson-survival-agent</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/zhangmeng/.codex/projects/wilson-survival-agent/probe/bridge.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/zhangmeng/.codex/projects/wilson-survival-agent/probe/bridge.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,9 @@
+name = "Wilson Survival Agent (Test)"
+description = "Local first-night survival agent with spoken intent for a private test world."
+author = "Wilson Survival Agent"
+version = "0.18.0"
+api_version = 10
+dst_compatible = true
+server_only_mod = false
+all_clients_require_mod = true
+client_only_mod = false
