@@ -86,6 +86,24 @@ class SurvivalPlannerTests(unittest.TestCase):
             nearest_threat=threat,
             movement={"epoch": "epoch", "id": 3, "status": "started"}), "epoch"))
 
+    def test_exploration_stops_for_grass_reached_along_route(self):
+        planner = SurvivalPlanner()
+        start = observation()
+        planner.start(start)
+        move = planner.on_observation(start, "epoch")
+        self.assertEqual(move["type"], "MOVE_TO_POINT")
+        planner.record_command(1, move)
+        grass = {"guid": 99, "prefab": "grass", "kind": "harvest",
+                 "ready": True, "dx": 3, "dz": 0, "marsh_steps": 0}
+        passing = observation(local_entities=[grass],
+                              movement={"epoch": "epoch", "id": 1,
+                                        "status": "started"})
+        stop = planner.on_observation(passing, "epoch")
+        self.assertEqual(stop["type"], "STOP")
+        planner.record_command(2, stop)
+        passing["movement"]["status"] = "stopped"
+        self.assertEqual(planner.on_observation(passing, "epoch")["type"], "PICK_TARGET")
+
     def test_daylight_puts_torch_away(self):
         planner = SurvivalPlanner()
         planner.start(observation())

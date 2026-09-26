@@ -1,11 +1,24 @@
 import json
+import re
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from urllib.request import Request, urlopen
 
 import bridge
 from test_survival import observation
+
+
+class ModVersionTests(unittest.TestCase):
+    def test_game_report_matches_bridge_version(self):
+        mod = Path(__file__).with_name("wilson_p0_probe")
+        main = (mod / "modmain.lua").read_text()
+        info = (mod / "modinfo.lua").read_text()
+        self.assertEqual(re.search(r'mod_version = "([^"]+)"', main).group(1),
+                         bridge.MOD_VERSION)
+        self.assertEqual(re.search(r'version = "([^"]+)"', info).group(1),
+                         bridge.MOD_VERSION)
 
 
 class BridgeSurvivalTests(unittest.TestCase):

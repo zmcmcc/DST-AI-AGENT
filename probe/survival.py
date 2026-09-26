@@ -252,7 +252,8 @@ class SurvivalPlanner:
                     counts = inventory.get("counts") or {}
                     free_slots = inventory.get("free_slots", 15)
                     for target in observation.get("local_entities") or []:
-                        if target.get("kind") != "pickup" or target.get("ready") is not True:
+                        kind = target.get("kind")
+                        if kind not in ("pickup", "harvest") or target.get("ready") is not True:
                             continue
                         prefab = target.get("prefab")
                         if (prefab in ("flint", "rocks", "goldnugget", "smallmeat")
@@ -262,13 +263,26 @@ class SurvivalPlanner:
                                 and inventory.get("food_ready_hunger", 0) >= 125):
                             continue
                         distance = (target.get("dx", 99) ** 2 + target.get("dz", 99) ** 2) ** 0.5
-                        if (distance <= 2.5
+                        harvest_useful = False
+                        if kind == "harvest" and prefab in HARVEST_PREFABS and free_slots > 0:
+                            if prefab == "grass":
+                                harvest_useful = counts.get("cutgrass", 0) < 12
+                            elif prefab == "sapling":
+                                harvest_useful = counts.get("twigs", 0) < 12
+                            else:
+                                harvest_useful = inventory.get("food_ready_hunger", 0) < 75
+                        pickup_useful = (kind == "pickup" and loose_item_offer(
+                            prefab, counts.get(prefab, 0), free_slots, distance) is not None)
+                        if (distance <= (4 if harvest_useful else 2.5)
+                                and (harvest_useful or pickup_useful)
                                 and self.avoid_targets.get(target.get("guid"), 0) <= time.monotonic()
-                                and loose_item_offer(prefab, counts.get(prefab, 0),
-                                                     free_slots, distance) is not None):
+                                and not self._route_near_hazard(observation, target)
+                                and (observation.get("cycles", 0) >= 2
+                                     or observation.get("on_marsh") is True
+                                     or target.get("marsh_steps", 0) == 0)):
                             self.reason = "passing_loot"
                             return {"type": "STOP", "target_id": self.action_id,
-                                    "goal": "stockpile", "say": "路边有物资，我捡一下"}
+                                    "goal": "stockpile", "say": "路边有资源，我顺手收集"}
                 return None
 
         local_move = observation.get("movement") or {}

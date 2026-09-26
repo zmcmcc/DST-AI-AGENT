@@ -567,7 +567,8 @@ AddPlayerPostInit(function(inst)
         local locomotor = inst.components.locomotor
         local own_move = locomotor ~= nil and move.owned_dest ~= nil
             and locomotor.dest == move.owned_dest
-        if own_move then
+        local coast = own_move and status == "arrived" and move.goal == "explore"
+        if own_move and not coast then
             locomotor:Stop()
         end
         local x, _, z = inst.Transform:GetWorldPosition()
@@ -576,7 +577,9 @@ AddPlayerPostInit(function(inst)
         move.distance_to_goal = G.math.sqrt((x - move.goal_x) ^ 2
             + (z - move.goal_z) ^ 2)
         SetMoveStatus(move, status)
-        SendClientMove("move_stop", move.epoch, move.id)
+        if not coast then
+            SendClientMove("move_stop", move.epoch, move.id)
+        end
         G.print("[Wilson P0] move id=" .. move.id
             .. " delta_x=" .. G.tostring(move.delta_x)
             .. " delta_z=" .. G.tostring(move.delta_z)
@@ -600,39 +603,75 @@ AddPlayerPostInit(function(inst)
         local length = G.math.sqrt(dx * dx + dz * dz)
         if length > 0.01 then
             pick.preview_id = preview_id or pick.id
-            local action = pick.action ~= nil and pick.action.action or nil
-            local action_name = action == G.ACTIONS.PICK and "PICK"
-                or action == G.ACTIONS.PICKUP and "PICKUP"
-                or action == G.ACTIONS.CHOP and "CHOP" or nil
             SendClientMove("move_start", pick.epoch, pick.preview_id,
-                tx + dx / length, tz + dz / length, action_name, target.GUID)
+                tx + dx / length, tz + dz / length)
         end
     end
 
     local function PushApproachedAction(pick, target, action, preview_id, on_failed)
         local locomotor = inst.components.locomotor
-        local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
-        if not ok then
+        local function push()
+            if active_pick ~= pick or pick.status ~= "started" then
+                return
+            end
+            if not target:IsValid() then
+                on_failed()
+                return
+            end
+            local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
+            if not ok then
+                on_failed()
+            elseif pick.status == "started"
+                and locomotor.bufferedaction ~= action
+                and inst:GetBufferedAction() ~= action then
+                on_failed()
+            end
+        end
+        if inst:GetDistanceSqToInst(target) <= 4 then
+            push()
+            return
+        end
+        local ok = G.pcall(locomotor.GoToEntity, locomotor, target, nil, false)
+        if not ok or locomotor.dest == nil then
             on_failed()
             return
         end
-        if pick.status ~= "started" then
-            return
-        end
-        if locomotor.bufferedaction ~= action
-            and inst:GetBufferedAction() ~= action then
-            on_failed()
-            return
-        end
-        pick.approaching = locomotor.bufferedaction == action
+        pick.approaching = true
         pick.approach_dest = locomotor.dest
         StartPickPreview(pick, target, preview_id)
+        local started = G.GetTime()
+        local function check_approach()
+            if active_pick ~= pick or pick.status ~= "started"
+                or pick.action ~= action or not pick.approaching then
+                return
+            end
+            if not target:IsValid() or G.GetTime() - started > 8
+                or (locomotor.dest ~= pick.approach_dest
+                    and inst:GetDistanceSqToInst(target) > 4) then
+                if locomotor.dest == pick.approach_dest then
+                    locomotor:Stop()
+                end
+                pick.approaching = false
+                StopPickPreview(pick)
+                on_failed()
+            elseif inst:GetDistanceSqToInst(target) <= 4 then
+                pick.approaching = false
+                StopPickPreview(pick)
+                push()
+            else
+                inst:DoTaskInTime(0.05, check_approach)
+            end
+        end
+        inst:DoTaskInTime(0.05, check_approach)
     end
 
     local function StopPickMotion(pick)
         local locomotor = inst.components.locomotor
         if locomotor ~= nil then
-            if pick.action ~= nil and (locomotor.bufferedaction == pick.action
+            if pick.approaching and pick.approach_dest ~= nil
+                and locomotor.dest == pick.approach_dest then
+                locomotor:Stop()
+            elseif pick.action ~= nil and (locomotor.bufferedaction == pick.action
                 or inst:GetBufferedAction() == pick.action) then
                 if inst:GetBufferedAction() == pick.action then
                     inst:ClearBufferedAction()
@@ -1290,6 +1329,12 @@ AddPlayerPostInit(function(inst)
                 and locomotor.dest == active_move.owned_dest then
                 FinishMove(active_move, "interrupted_threat")
                 SayIntent({}, "附近有危险，我先停下")
+            elseif active_move ~= nil and active_move.status == "arrived"
+                and active_move.goal == "explore"
+                and active_move.owned_dest ~= nil
+                and locomotor.dest == active_move.owned_dest then
+                locomotor:Stop()
+                SendClientMove("move_stop", active_move.epoch, active_move.id)
             elseif active_pick ~= nil and active_pick.status == "started"
                 and (inst:GetBufferedAction() == active_pick.action
                     or active_pick.approaching
@@ -1318,7 +1363,8 @@ AddPlayerPostInit(function(inst)
             move.distance_to_goal = G.math.sqrt(remaining_sq)
             move.progress = G.math.max(0, G.math.min(1,
                 1 - move.distance_to_goal / move.initial_distance))
-            if remaining_sq <= (move.type == "MOVE_TO_TARGET" and 0.25 or 4) then
+            if remaining_sq <= (move.type == "MOVE_TO_TARGET" and 0.25
+                or move.goal == "explore" and 16 or 4) then
                 FinishMove(move, "arrived")
             elseif locomotor ~= nil and locomotor.dest ~= nil
                 and locomotor.dest ~= move.owned_dest then
@@ -1411,7 +1457,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.24.0",
+            mod_version = "0.25.0",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,
@@ -1572,6 +1618,7 @@ AddPlayerPostInit(function(inst)
                                 epoch = command.epoch,
                                 id = command.id,
                                 type = command.type,
+                                goal = command.goal,
                                 target_guid = is_target and target.GUID or nil,
                                 escape = is_escape,
                                 status = "received",
