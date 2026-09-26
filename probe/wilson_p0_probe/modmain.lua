@@ -1,6 +1,7 @@
 local G = GLOBAL
 local URL = "http://127.0.0.1:8765/probe"
 local SENSE_RADIUS = 8
+local HAZARD_OBSERVE_RADIUS = 16
 local FROG_DANGER_RADIUS_SQ = ((G.TUNING.FROG_TARGET_DIST or 4) + 0.5) ^ 2
 local RESOURCE_RADIUS = 40
 local MAX_LOCAL_ENTITIES = 64
@@ -216,21 +217,44 @@ local function ReadInventory(inst)
 end
 
 local FRONTIER_DIRECTIONS = {
+    {36, 0}, {25.5, 25.5}, {0, 36}, {-25.5, 25.5},
+    {-36, 0}, {-25.5, -25.5}, {0, -36}, {25.5, -25.5},
     {18, 0}, {12.7, 12.7}, {0, 18}, {-12.7, 12.7},
     {-18, 0}, {-12.7, -12.7}, {0, -18}, {12.7, -12.7},
     {6, 0}, {4.25, 4.25}, {0, 6}, {-4.25, 4.25},
     {-6, 0}, {-4.25, -4.25}, {0, -6}, {4.25, -4.25},
 }
 
+local function ReadRouteTerrain(x, z, dx, dz)
+    local map = G.TheWorld.Map
+    local steps = G.math.max(1, G.math.ceil(G.math.sqrt(dx * dx + dz * dz) / 4))
+    local passable = true
+    local marsh_steps = 0
+    for step = 1, steps do
+        local px, pz = x + dx * step / steps, z + dz * step / steps
+        if not map:IsPassableAtPoint(px, 0, pz) then
+            passable = false
+        end
+        if map:GetTileAtPoint(px, 0, pz) == G.WORLD_TILES.MARSH then
+            marsh_steps = marsh_steps + 1
+        end
+    end
+    return passable, marsh_steps
+end
+
 local function ReadFrontier(x, z)
     local points = {}
     local map = G.TheWorld.Map
     for _, direction in G.ipairs(FRONTIER_DIRECTIONS) do
         local dx, dz = direction[1], direction[2]
+        local passable, marsh_steps = ReadRouteTerrain(x, z, dx, dz)
         points[#points + 1] = {
             dx = dx,
             dz = dz,
-            passable = map:IsPassableAtPoint(x + dx, 0, z + dz),
+            passable = passable,
+            marsh_steps = marsh_steps,
+            endpoint_marsh = map:GetTileAtPoint(x + dx, 0, z + dz)
+                == G.WORLD_TILES.MARSH,
         }
     end
     return points
@@ -285,6 +309,7 @@ local function ReadLocalEntities(inst, x, z)
 
     local nearby, included, seen_prefabs = {}, {}, {}
     local function Include(entity)
+        local passable, marsh_steps = ReadRouteTerrain(x, z, entity.dx, entity.dz)
         nearby[#nearby + 1] = {
             guid = entity.guid,
             prefab = entity.prefab,
@@ -292,6 +317,7 @@ local function ReadLocalEntities(inst, x, z)
             dz = entity.dz,
             ready = entity.ready,
             kind = entity.kind,
+            marsh_steps = marsh_steps,
         }
         included[entity.guid] = true
     end
@@ -381,12 +407,12 @@ local function ReadVisibleHazards(inst, radius)
     local hazards = {}
     for _, entity in G.ipairs(entities) do
         if THREAT_PREFABS[entity.prefab] and G.CanEntitySeeTarget(inst, entity) then
-            if entity.prefab == "frog" then
-                frog_visible = true
-            end
             local ex, _, ez = entity.Transform:GetWorldPosition()
             local dx, dz = ex - x, ez - z
             local distance_sq = dx * dx + dz * dz
+            if entity.prefab == "frog" and distance_sq <= SENSE_RADIUS ^ 2 then
+                frog_visible = true
+            end
             local combat = entity.components.combat
             local targeting_player = combat ~= nil and combat.target == inst
             hazards[#hazards + 1] = {
@@ -396,8 +422,9 @@ local function ReadVisibleHazards(inst, radius)
                 distance_sq = distance_sq,
                 targeting_player = targeting_player,
             }
-            local immediate = entity.prefab ~= "frog" or targeting_player
-                or distance_sq <= FROG_DANGER_RADIUS_SQ
+            local immediate = targeting_player or (distance_sq <= SENSE_RADIUS ^ 2
+                and (entity.prefab ~= "frog"
+                    or distance_sq <= FROG_DANGER_RADIUS_SQ))
             if immediate and (nearest_distance_sq == nil
                 or distance_sq < nearest_distance_sq) then
                 threat_visible = true
@@ -1209,7 +1236,7 @@ AddPlayerPostInit(function(inst)
 
     inst:DoPeriodicTask(0.5, function()
         local frog_visible, threat_visible, nearest_threat, visible_hazards =
-            ReadVisibleHazards(inst, SENSE_RADIUS)
+            ReadVisibleHazards(inst, HAZARD_OBSERVE_RADIUS)
         local locomotor = inst.components.locomotor
         local inventory = inst.components.inventory
         local clock = G.TheWorld.net ~= nil and G.TheWorld.net.components.clock or nil
@@ -1301,7 +1328,8 @@ AddPlayerPostInit(function(inst)
                 move.last_progress_x = x
                 move.last_progress_z = z
                 move.last_progress_at = G.GetTime()
-            elseif G.GetTime() - move.last_progress_at >= 1.5 then
+            elseif G.GetTime() - move.last_progress_at >= (
+                move.initial_distance > 20 and 2.5 or 1.5) then
                 FinishMove(move, "blocked")
             end
         end
@@ -1392,6 +1420,8 @@ AddPlayerPostInit(function(inst)
             phase_progress = G.TheWorld.state.timeinphase,
             x = x,
             z = z,
+            on_marsh = G.TheWorld.Map:GetTileAtPoint(x, 0, z)
+                == G.WORLD_TILES.MARSH,
             vitals = ReadVitals(inst),
             inventory = ReadInventory(inst),
             in_light = inst:IsInLight(),
@@ -1526,7 +1556,7 @@ AddPlayerPostInit(function(inst)
                         local threat_end_distance_sq = nearest_threat ~= nil and
                             (goal_x - px - nearest_threat.dx) ^ 2
                             + (goal_z - pz - nearest_threat.dz) ^ 2 or nil
-                        if is_point and (point_distance_sq > 400
+                        if is_point and (point_distance_sq > 1600
                             or not G.TheWorld.Map:IsPassableAtPoint(goal_x, 0, goal_z)) then
                             status = "rejected_point"
                         elseif is_escape and nearest_threat ~= nil

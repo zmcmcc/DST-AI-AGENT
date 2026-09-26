@@ -83,9 +83,11 @@ class SurvivalPlanner:
         self.blocked_cells = set()
         self.seen_resources = set()
         self.avoid_targets = {}
-        self.frog_zones = {}
+        self.hazard_zones = {}
         self.retry_after = {}
         self.heading = None
+        self.last_position = None
+        self.last_cell = None
         self.eating_batch = False
         self.food_refill_active = False
         self.material_refill = {"grass": False, "sapling": False}
@@ -125,7 +127,6 @@ class SurvivalPlanner:
         self.enabled = True
         self.guid = observation["guid"]
         self.reason = "started"
-        self._mark_visit(observation.get("x"), observation.get("z"))
         self._remember(observation)
         self._record_milestone(observation)
 
@@ -296,6 +297,13 @@ class SurvivalPlanner:
                                    "rejected_point")):
                 self._mark_visit(*self.action_point, amount=4)
                 self.blocked_cells.add(self._cell(*self.action_point))
+                if self.last_position is not None:
+                    px, pz = self.last_position
+                    dx, dz = self.action_point[0] - px, self.action_point[1] - pz
+                    length = (dx * dx + dz * dz) ** 0.5
+                    if length > 0:
+                        self.blocked_cells.add(self._cell(px + 5 * dx / length,
+                                                          pz + 5 * dz / length))
         if status == "interrupted_threat" and self.action_target is not None:
             self.avoid_targets[self.action_target] = time.monotonic() + 20
         if status in ("interrupted_threat", "interrupted_light", "stopped") and self.collect_area:
@@ -341,7 +349,7 @@ class SurvivalPlanner:
             if (item is not None and item.get("prefab") == entry["prefab"]
                     and item.get("kind") == entry["kind"]
                     and self.avoid_targets.get(entry["guid"], 0) <= now
-                    and not self._route_near_frog(observation, item)):
+                    and not self._route_near_hazard(observation, item)):
                 available.append(item)
         if not available:
             self._end_area("AREA_EXHAUSTED")
@@ -369,26 +377,58 @@ class SurvivalPlanner:
     def _cell(x, z):
         return (round(x / 4), round(z / 4))
 
-    def _route_near_frog(self, observation, target):
+    @staticmethod
+    def _hazard_radius(prefab):
+        return 4.5 if prefab == "frog" else 10 if prefab == "tentacle" else 8
+
+    def _route_near_hazard(self, observation, target):
         dx, dz = target.get("dx"), target.get("dz")
         if not isinstance(dx, (int, float)) or not isinstance(dz, (int, float)):
             return False
         length_sq = dx * dx + dz * dz
-        hazards = [(item.get("dx"), item.get("dz"))
-                   for item in observation.get("visible_hazards") or []
-                   if item.get("prefab") == "frog"]
         x, z = observation.get("x"), observation.get("z")
+        hazards = [(item.get("dx"), item.get("dz"),
+                    self._hazard_radius(item.get("prefab")))
+                   for item in observation.get("visible_hazards") or []]
         if isinstance(x, (int, float)) and isinstance(z, (int, float)):
-            hazards.extend((world_x - x, world_z - z)
-                           for world_x, world_z, expiry in self.frog_zones.values()
+            hazards.extend((world_x - x, world_z - z, radius)
+                           for world_x, world_z, radius, expiry in self.hazard_zones.values()
                            if expiry > time.monotonic())
-        for hx, hz in hazards:
+        for hx, hz, radius in hazards:
             if not isinstance(hx, (int, float)) or not isinstance(hz, (int, float)):
                 continue
             progress = max(0, min(1, (hx * dx + hz * dz) / max(length_sq, 0.01)))
-            if (hx - progress * dx) ** 2 + (hz - progress * dz) ** 2 < 20.25:
+            start_sq = hx * hx + hz * hz
+            end_sq = (hx - dx) ** 2 + (hz - dz) ** 2
+            if (start_sq < radius * radius and end_sq > radius * radius
+                    and hx * dx + hz * dz <= 0):
+                continue
+            if (hx - progress * dx) ** 2 + (hz - progress * dz) ** 2 < radius * radius:
                 return True
         return False
+
+    def _leave_marsh(self, observation):
+        x, z = observation.get("x"), observation.get("z")
+        if not isinstance(x, (int, float)) or not isinstance(z, (int, float)):
+            return None
+        exits = []
+        for point in observation.get("frontier") or []:
+            dx, dz = point.get("dx"), point.get("dz")
+            if (point.get("passable") is True
+                    and point.get("endpoint_marsh") is False
+                    and isinstance(dx, (int, float))
+                    and isinstance(dz, (int, float))
+                    and self._cell(x + dx, z + dz) not in self.blocked_cells
+                    and not self._route_near_hazard(observation, point)):
+                exits.append((point.get("marsh_steps", 0), dx * dx + dz * dz,
+                              x + dx, z + dz, dx, dz))
+        if not exits:
+            return None
+        _, _, goal_x, goal_z, dx, dz = min(exits)
+        self.heading = (dx, dz)
+        self.events.append(f"leave_marsh destination=({goal_x:.1f},{goal_z:.1f})")
+        return {"type": "MOVE_TO_POINT", "x": goal_x, "z": goal_z,
+                "goal": "avoid_threat", "say": "这片沼泽太危险，我先离开"}
 
     def _mark_visit(self, x, z, amount=1):
         if isinstance(x, (int, float)) and isinstance(z, (int, float)):
@@ -399,17 +439,23 @@ class SurvivalPlanner:
         x, z = observation.get("x"), observation.get("z")
         if not isinstance(x, (int, float)) or not isinstance(z, (int, float)):
             return
+        self.last_position = (x, z)
+        cell = self._cell(x, z)
+        if cell != self.last_cell:
+            self._mark_visit(x, z)
+            self.last_cell = cell
         now = time.monotonic()
-        self.frog_zones = {cell: zone for cell, zone in self.frog_zones.items()
-                           if zone[2] > now}
+        self.hazard_zones = {cell: zone for cell, zone in self.hazard_zones.items()
+                             if zone[3] > now}
         for hazard in observation.get("visible_hazards") or []:
             dx, dz = hazard.get("dx"), hazard.get("dz")
-            if (hazard.get("prefab") == "frog"
-                    and isinstance(dx, (int, float))
+            if (isinstance(dx, (int, float))
                     and isinstance(dz, (int, float))):
                 world_x, world_z = x + dx, z + dz
-                self.frog_zones[self._cell(world_x, world_z)] = (world_x, world_z,
-                                                                 now + 30)
+                prefab = hazard.get("prefab")
+                self.hazard_zones[(prefab, self._cell(world_x, world_z))] = (
+                    world_x, world_z, self._hazard_radius(prefab),
+                    now + (120 if prefab == "tentacle" else 35))
         self._mark_visible_cells(x, z)
         for entity in observation.get("local_entities") or []:
             if entity.get("ready") is True and isinstance(entity.get("guid"), int):
@@ -567,6 +613,12 @@ class SurvivalPlanner:
 
         nearby = observation.get("local_entities") or []
         now = time.monotonic()
+        if (observation.get("on_marsh") is True
+                and observation.get("cycles", 0) < 2 and phase in ("day", "dusk")):
+            exit_choice = self._leave_marsh(observation)
+            if exit_choice is not None:
+                self._end_area("LEAVING_MARSH")
+                return exit_choice
         if self.collect_area is not None:
             if critical_hunger or night_imminent or phase == "night":
                 self._end_area("SURVIVAL_INTERRUPT")
@@ -678,8 +730,13 @@ class SurvivalPlanner:
                 rejected.append(f"{label}=OUTSIDE_ALLOWED_RADIUS")
                 continue
             distance = distance_sq ** 0.5
-            if self._route_near_frog(observation, target):
-                rejected.append(f"{label}=UNSAFE_FROG_ROUTE")
+            if self._route_near_hazard(observation, target):
+                rejected.append(f"{label}=UNSAFE_HAZARD_ROUTE")
+                continue
+            if (observation.get("cycles", 0) < 2
+                    and observation.get("on_marsh") is not True
+                    and target.get("marsh_steps", 0) > 0):
+                rejected.append(f"{label}=MARSH_ROUTE")
                 continue
             matched = False
             for resource, prefabs in RESOURCE_PREFABS.items():
@@ -787,24 +844,45 @@ class SurvivalPlanner:
             self.reason = "position_unknown"
             return None
         choices = []
+        marsh_choices = []
         for index, point in enumerate(frontier):
             dx, dz = point.get("dx"), point.get("dz")
             if point.get("passable") is not True or not isinstance(dx, (int, float)) or not isinstance(dz, (int, float)):
                 continue
-            if self._route_near_frog(observation, point):
+            if self._route_near_hazard(observation, point):
                 continue
             if (phase == "night" and ready_light_seconds < night_seconds + 30
                     and dx * dx + dz * dz > 64):
                 continue
             destination = (x + dx, z + dz)
             cell = self._cell(*destination)
-            if cell in self.blocked_cells:
+            distance = (dx * dx + dz * dz) ** 0.5
+            crossed_cells = [self._cell(x + dx * step / max(1, int(distance / 4)),
+                                        z + dz * step / max(1, int(distance / 4)))
+                             for step in range(1, max(1, int(distance / 4)) + 1)]
+            if cell in self.blocked_cells or any(
+                    crossed in self.blocked_cells for crossed in crossed_cells):
                 continue
-            visits = self.visits.get(self._cell(*destination), 0)
-            straight = self.heading is not None and self.heading == (dx, dz)
+            visits = sum(self.visits.get(crossed, 0) for crossed in crossed_cells)
+            if self.heading is not None:
+                hx, hz = self.heading
+                heading_length = (hx * hx + hz * hz) ** 0.5
+                alignment = ((hx * dx + hz * dz) / (heading_length * distance)
+                             if heading_length > 0 and distance > 0 else 0)
+                turn_cost = 24 * (1 - alignment)
+            else:
+                turn_cost = 0
             new_cells = len(self._cells_visible_from(*destination) - self.seen_cells)
-            score = visits * 1.5 - new_cells + (0 if straight else 20)
-            choices.append((score, visits, index, destination, (dx, dz)))
+            marsh_steps = point.get("marsh_steps", 0)
+            score = visits * 1.5 - new_cells + turn_cost + marsh_steps * 35
+            row = (score, visits, index, destination, (dx, dz))
+            if (marsh_steps > 0 and observation.get("cycles", 0) < 2
+                    and observation.get("on_marsh") is not True):
+                marsh_choices.append(row)
+            else:
+                choices.append(row)
+        if not choices:
+            choices = marsh_choices
         if not choices:
             self.reason = "no_walkable_frontier"
             return None
@@ -823,8 +901,7 @@ class SurvivalPlanner:
         return {"type": "MOVE_TO_POINT", "x": destination[0], "z": destination[1],
                 "goal": "explore", "say": say}
 
-    @staticmethod
-    def _resource_choice(prefab, target, observation=None, behavior_id=None):
+    def _resource_choice(self, prefab, target, observation=None, behavior_id=None):
         name = (RESOURCE_NAMES.get(prefab)
                 or ITEM_CATALOG.get(target["prefab"], (target["prefab"],))[0])
         distance_sq = target["dx"] ** 2 + target["dz"] ** 2
@@ -840,7 +917,11 @@ class SurvivalPlanner:
                 "wood" if prefab == "wood" else "light")
         if distance_sq > 324 and observation is not None:
             frontier = [point for point in observation.get("frontier") or []
-                        if point.get("passable") is True]
+                        if point.get("passable") is True
+                        and not self._route_near_hazard(observation, point)
+                        and (observation.get("cycles", 0) >= 2
+                             or observation.get("on_marsh") is True
+                             or point.get("marsh_steps", 0) == 0)]
             if frontier:
                 waypoint = min(frontier, key=lambda point:
                                (point["dx"] - target["dx"]) ** 2
@@ -880,18 +961,30 @@ class SurvivalPlanner:
             if point.get("passable") is not True or not all(
                     isinstance(value, (int, float)) for value in (px, pz)):
                 continue
-            if px * px + pz * pz > 64:
+            distance_sq = px * px + pz * pz
+            if distance_sq > 400:
                 continue
             new_distance_sq = (px - dx) ** 2 + (pz - dz) ** 2
             if new_distance_sq <= current_distance_sq + 4:
                 continue
+            if self._route_near_hazard(observation, point):
+                continue
             destination = (x + px, z + pz)
+            if self._cell(*destination) in self.blocked_cells:
+                continue
+            marsh_cost = (point.get("marsh_steps", 0) * 30
+                          if observation.get("on_marsh") is not True else
+                          point.get("marsh_steps", 0) * 10)
+            if point.get("endpoint_marsh") is True:
+                marsh_cost += 60
             visits = self.visits.get(self._cell(*destination), 0)
-            options.append((visits, -new_distance_sq, index, destination))
+            score = marsh_cost + visits * 3 - new_distance_sq * 0.12 - distance_sq * 0.03
+            options.append((score, index, destination, (px, pz)))
         if not options:
             self.reason = "no_safe_escape_point"
             return None
-        _, _, _, destination = min(options)
+        _, _, destination, heading = min(options)
+        self.heading = heading
         self.reason = "avoiding_threat"
         return {"type": "MOVE_TO_POINT", "x": destination[0], "z": destination[1],
                 "escape": True, "goal": "avoid_threat",

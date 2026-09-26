@@ -195,7 +195,7 @@ class SurvivalPlannerTests(unittest.TestCase):
         planner.start(state)
         choice = planner.on_observation(state, "epoch")
         self.assertEqual(choice["type"], "MOVE_TO_POINT")
-        self.assertTrue(any("UNSAFE_FROG_ROUTE" in event for event in planner.events))
+        self.assertTrue(any("UNSAFE_HAZARD_ROUTE" in event for event in planner.events))
 
     def test_frog_route_remains_avoided_after_short_escape(self):
         planner = SurvivalPlanner()
@@ -208,7 +208,7 @@ class SurvivalPlannerTests(unittest.TestCase):
             {"guid": 201, "prefab": "berrybush", "kind": "harvest", "ready": True,
              "dx": 13, "dz": 0},
         ], visible_hazards=[])
-        self.assertTrue(planner._route_near_frog(later, later["local_entities"][0]))
+        self.assertTrue(planner._route_near_hazard(later, later["local_entities"][0]))
 
     def test_direct_pick_for_grass_visible_twelve_units_away(self):
         planner = SurvivalPlanner()
@@ -397,6 +397,74 @@ class SurvivalPlannerTests(unittest.TestCase):
         choice = planner.on_observation(state, "epoch")
         self.assertEqual((choice["x"], choice["z"]), (6, 0))
         self.assertEqual(planner.reason, "searching_grass")
+
+    def test_exploration_takes_long_safe_leg(self):
+        planner = SurvivalPlanner()
+        state = observation(frontier=[
+            {"dx": 36, "dz": 0, "passable": True, "marsh_steps": 0},
+            {"dx": 6, "dz": 0, "passable": True, "marsh_steps": 0},
+        ])
+        planner.start(state)
+        choice = planner.on_observation(state, "epoch")
+        self.assertEqual((choice["x"], choice["z"]), (36, 0))
+
+    def test_exploration_avoids_marsh_and_tentacle_ahead(self):
+        planner = SurvivalPlanner()
+        state = observation(frontier=[
+            {"dx": 36, "dz": 0, "passable": True, "marsh_steps": 9},
+            {"dx": 0, "dz": 18, "passable": True, "marsh_steps": 0},
+        ], visible_hazards=[{"prefab": "tentacle", "dx": 12, "dz": 0}])
+        planner.start(state)
+        choice = planner.on_observation(state, "epoch")
+        self.assertEqual((choice["x"], choice["z"]), (0, 18))
+
+    def test_escape_uses_long_leg_and_remembers_danger(self):
+        planner = SurvivalPlanner()
+        danger = observation(visible_threat_within_8=True,
+            nearest_threat={"prefab": "tentacle", "dx": 4, "dz": 0},
+            visible_hazards=[{"prefab": "tentacle", "dx": 4, "dz": 0}],
+            frontier=[{"dx": -18, "dz": 0, "passable": True, "marsh_steps": 0},
+                      {"dx": 0, "dz": 6, "passable": True, "marsh_steps": 0}])
+        planner.start(danger)
+        escape = planner.on_observation(danger, "epoch")
+        self.assertEqual((escape["x"], escape["z"]), (-18, 0))
+        self.assertTrue(escape["escape"])
+        after = observation(x=-18, visible_hazards=[], frontier=[
+            {"dx": 36, "dz": 0, "passable": True, "marsh_steps": 0},
+            {"dx": 0, "dz": 18, "passable": True, "marsh_steps": 0},
+        ])
+        planner._remember(after)
+        self.assertTrue(planner._route_near_hazard(after, after["frontier"][0]))
+        self.assertFalse(planner._route_near_hazard(after, after["frontier"][1]))
+
+    def test_leaves_marsh_before_collecting(self):
+        planner = SurvivalPlanner()
+        state = observation(on_marsh=True, frontier=[
+            {"dx": 0, "dz": 6, "passable": True, "marsh_steps": 1,
+             "endpoint_marsh": False},
+            {"dx": 18, "dz": 0, "passable": True, "marsh_steps": 5,
+             "endpoint_marsh": True},
+        ], local_entities=[{"guid": 99, "prefab": "grass", "kind": "harvest",
+                            "ready": True, "dx": 1, "dz": 0}])
+        planner.start(state)
+        choice = planner.on_observation(state, "epoch")
+        self.assertEqual((choice["x"], choice["z"]), (0, 6))
+
+    def test_blocked_leg_changes_direction(self):
+        planner = SurvivalPlanner()
+        state = observation(frontier=[
+            {"dx": 36, "dz": 0, "passable": True, "marsh_steps": 0},
+            {"dx": 0, "dz": 18, "passable": True, "marsh_steps": 0},
+        ])
+        planner.start(state)
+        first = planner.on_observation(state, "epoch")
+        self.assertEqual((first["x"], first["z"]), (36, 0))
+        planner.record_command(1, first)
+        after = observation(x=2, frontier=state["frontier"],
+                            movement={"epoch": "epoch", "id": 1,
+                                      "status": "blocked"})
+        next_move = planner.on_observation(after, "epoch")
+        self.assertEqual((next_move["x"], next_move["z"]), (2, 18))
 
     def test_critical_hunger_eats_before_daylight_torch_crafting(self):
         planner = SurvivalPlanner()
