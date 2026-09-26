@@ -210,13 +210,13 @@ class SurvivalPlannerTests(unittest.TestCase):
         ], visible_hazards=[])
         self.assertTrue(planner._route_near_frog(later, later["local_entities"][0]))
 
-    def test_moves_toward_grass_visible_twelve_units_away(self):
+    def test_direct_pick_for_grass_visible_twelve_units_away(self):
         planner = SurvivalPlanner()
         state = observation(local_entities=[
             {"guid": 75, "prefab": "grass", "ready": True, "dx": 12, "dz": 0}])
         planner.start(state)
         choice = planner.on_observation(state, "epoch")
-        self.assertEqual(choice["type"], "MOVE_TO_TARGET")
+        self.assertEqual(choice["type"], "PICK_TARGET")
         self.assertEqual(choice["target_guid"], 75)
 
     def test_loose_twigs_are_picked_up_for_torch(self):
@@ -613,7 +613,7 @@ class SurvivalPlannerTests(unittest.TestCase):
         self.assertTrue(any("chosen=" in event and "top=[" in event
                             for event in planner.events))
 
-    def test_distant_loot_cluster_keeps_behavior_during_approach(self):
+    def test_distant_area_approaches_and_collects_in_one_command(self):
         planner = SurvivalPlanner()
         supplies = {"cutgrass": 8, "twigs": 8, "torch": 2}
         inventory = {"counts": supplies, "free_slots": 10,
@@ -624,17 +624,10 @@ class SurvivalPlannerTests(unittest.TestCase):
                   "ready": True, "dx": 11, "dz": 0}
         state = observation(local_entities=[first, second], inventory=inventory)
         planner.start(state)
-        approach = planner.on_observation(state, "epoch")
-        self.assertEqual(approach["type"], "MOVE_TO_TARGET")
-        planner.record_command(1, approach)
-        arrived = observation(x=9, local_entities=[{**first, "dx": 1},
-                                                  {**second, "dx": 2}],
-                              inventory=inventory,
-                              movement={"epoch": "epoch", "id": 1,
-                                        "status": "arrived"})
-        pickup = planner.on_observation(arrived, "epoch")
-        self.assertEqual(pickup["type"], "COLLECT_AREA")
-        self.assertEqual(pickup["behavior_id"], approach["behavior_id"])
+        choice = planner.on_observation(state, "epoch")
+        self.assertEqual(choice["type"], "COLLECT_AREA")
+        self.assertEqual({item["guid"] for item in choice["items"]}, {104, 105})
+        self.assertIsNotNone(choice["behavior_id"])
 
     def test_loot_cluster_interruption_keeps_items_already_collected(self):
         planner = SurvivalPlanner()

@@ -356,13 +356,6 @@ class SurvivalPlanner:
             available.remove(item)
             point = (item["dx"], item["dz"])
         first = ordered[0]
-        distance_sq = first["dx"] ** 2 + first["dz"] ** 2
-        if distance_sq > 64:
-            self.events.append(f"collect_area id={area['id']} approach="
-                               f"{first['prefab']}:{first['guid']} members={len(ordered)}")
-            return {"type": "MOVE_TO_TARGET", "target_guid": first["guid"],
-                    "target_prefab": first["prefab"], "behavior_id": area["id"],
-                    "goal": area["goal"], "say": "看到一片有用的资源，我过去收集"}
         items = [{"guid": item["guid"], "prefab": item["prefab"],
                   "kind": item["kind"]} for item in ordered]
         self.events.append(f"collect_area id={area['id']} batch=["
@@ -835,9 +828,10 @@ class SurvivalPlanner:
         name = (RESOURCE_NAMES.get(prefab)
                 or ITEM_CATALOG.get(target["prefab"], (target["prefab"],))[0])
         distance_sq = target["dx"] ** 2 + target["dz"] ** 2
+        direct_radius_sq = 64 if target["prefab"] in CHOP_PREFABS else 256
         action = (("PICK_TARGET" if target["prefab"] in HARVEST_PREFABS else
                    "FELL_TREE" if target["prefab"] in CHOP_PREFABS else "PICKUP_TARGET")
-                  if distance_sq <= 64 else "MOVE_TO_TARGET")
+                  if distance_sq <= direct_radius_sq else "MOVE_TO_TARGET")
         verb = "砍倒" if action == "FELL_TREE" else "捡" if action == "PICKUP_TARGET" else "采"
         say = (f"{name}不够，我{verb}一些" if action != "MOVE_TO_TARGET"
                else f"{name}不够，我走过去看看")

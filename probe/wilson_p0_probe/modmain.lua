@@ -422,7 +422,8 @@ end
 local CLIENT_MOVE_NAMESPACE = "wilson_p0_probe"
 local client_move = nil
 
-AddClientModRPCHandler(CLIENT_MOVE_NAMESPACE, "move_start", function(epoch, id, x, z)
+AddClientModRPCHandler(CLIENT_MOVE_NAMESPACE, "move_start", function(epoch, id, x, z,
+    action_name, target_guid)
     if G.TheWorld == nil or G.TheWorld.ismastersim then
         return
     end
@@ -438,7 +439,13 @@ AddClientModRPCHandler(CLIENT_MOVE_NAMESPACE, "move_start", function(epoch, id, 
     if client_move ~= nil and client_move.key == key then
         return
     end
-    local action = G.BufferedAction(player, nil, G.ACTIONS.WALKTO, nil, G.Vector3(x, 0, z))
+    local target = G.type(target_guid) == "number" and G.Ents[target_guid] or nil
+    local action_type = action_name == "PICK" and G.ACTIONS.PICK
+        or action_name == "PICKUP" and G.ACTIONS.PICKUP
+        or action_name == "CHOP" and G.ACTIONS.CHOP or nil
+    local action = target ~= nil and target:IsValid() and action_type ~= nil
+        and G.BufferedAction(player, target, action_type)
+        or G.BufferedAction(player, nil, G.ACTIONS.WALKTO, nil, G.Vector3(x, 0, z))
     local ok = G.pcall(locomotor.PreviewAction, locomotor, action, false)
     if ok then
         client_move = {key = key, owned_dest = locomotor.dest}
@@ -498,12 +505,17 @@ AddPlayerPostInit(function(inst)
         end
     end
 
-    local function SendClientMove(name, epoch, id, x, z)
+    local function SendClientMove(name, epoch, id, x, z, action_name, target_guid)
         if inst.userid ~= nil then
             local rpc = GetClientModRPC(CLIENT_MOVE_NAMESPACE, name)
             local ok, err
             if name == "move_start" then
-                ok, err = G.pcall(SendModRPCToClient, rpc, inst.userid, epoch, id, x, z)
+                if action_name ~= nil then
+                    ok, err = G.pcall(SendModRPCToClient, rpc, inst.userid, epoch, id,
+                        x, z, action_name, target_guid)
+                else
+                    ok, err = G.pcall(SendModRPCToClient, rpc, inst.userid, epoch, id, x, z)
+                end
             else
                 ok, err = G.pcall(SendModRPCToClient, rpc, inst.userid, epoch, id)
             end
@@ -552,7 +564,7 @@ AddPlayerPostInit(function(inst)
     end
 
     local function StartPickPreview(pick, target, preview_id)
-        if inst:GetDistanceSqToInst(target) <= 4 then
+        if inst:GetDistanceSqToInst(target) <= 2.25 then
             return
         end
         local px, _, pz = inst.Transform:GetWorldPosition()
@@ -561,73 +573,43 @@ AddPlayerPostInit(function(inst)
         local length = G.math.sqrt(dx * dx + dz * dz)
         if length > 0.01 then
             pick.preview_id = preview_id or pick.id
+            local action = pick.action ~= nil and pick.action.action or nil
+            local action_name = action == G.ACTIONS.PICK and "PICK"
+                or action == G.ACTIONS.PICKUP and "PICKUP"
+                or action == G.ACTIONS.CHOP and "CHOP" or nil
             SendClientMove("move_start", pick.epoch, pick.preview_id,
-                tx + dx / length, tz + dz / length)
+                tx + dx / length, tz + dz / length, action_name, target.GUID)
         end
     end
 
     local function PushApproachedAction(pick, target, action, preview_id, on_failed)
         local locomotor = inst.components.locomotor
-        local function push()
-            if active_pick ~= pick or pick.status ~= "started" then
-                return
-            end
-            if not target:IsValid() then
-                on_failed()
-                return
-            end
-            local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
-            if not ok then
-                on_failed()
-            end
-        end
-        if inst:GetDistanceSqToInst(target) <= 4 then
-            push()
-            return
-        end
-        local ok = G.pcall(locomotor.GoToEntity, locomotor, target, nil, false)
+        local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
         if not ok then
             on_failed()
             return
         end
-        pick.approaching = true
+        if pick.status ~= "started" then
+            return
+        end
+        if locomotor.bufferedaction ~= action
+            and inst:GetBufferedAction() ~= action then
+            on_failed()
+            return
+        end
+        pick.approaching = locomotor.bufferedaction == action
         pick.approach_dest = locomotor.dest
         StartPickPreview(pick, target, preview_id)
-        local started = G.GetTime()
-        local function check_approach()
-            if active_pick ~= pick or pick.status ~= "started"
-                or pick.action ~= action or not pick.approaching then
-                return
-            end
-            if not target:IsValid() or G.GetTime() - started > 8 then
-                pick.approaching = false
-                StopPickPreview(pick)
-                if locomotor.dest == pick.approach_dest then
-                    locomotor:Stop()
-                end
-                on_failed()
-            elseif inst:GetDistanceSqToInst(target) <= 4 then
-                pick.approaching = false
-                if locomotor.dest == pick.approach_dest then
-                    locomotor:Stop()
-                end
-                StopPickPreview(pick)
-                inst:DoTaskInTime(0.1, push)
-            else
-                inst:DoTaskInTime(0.1, check_approach)
-            end
-        end
-        inst:DoTaskInTime(0.1, check_approach)
     end
 
     local function StopPickMotion(pick)
         local locomotor = inst.components.locomotor
         if locomotor ~= nil then
-            if pick.approaching and pick.approach_dest ~= nil
-                and locomotor.dest == pick.approach_dest then
-                locomotor:Stop()
-            elseif pick.action ~= nil and inst:GetBufferedAction() == pick.action then
-                inst:ClearBufferedAction()
+            if pick.action ~= nil and (locomotor.bufferedaction == pick.action
+                or inst:GetBufferedAction() == pick.action) then
+                if inst:GetBufferedAction() == pick.action then
+                    inst:ClearBufferedAction()
+                end
                 locomotor:Clear()
                 locomotor:Stop()
             end
@@ -878,7 +860,7 @@ AddPlayerPostInit(function(inst)
             or target.components.pickable == nil
             or not target.components.pickable:CanBePicked()
             or not G.CanEntitySeeTarget(inst, target)
-            or inst:GetDistanceSqToInst(target) > (auto_pick and 64 or 9) then
+            or inst:GetDistanceSqToInst(target) > (auto_pick and 256 or 9) then
             SetPickStatus(pick, "rejected_target")
             return
         end
@@ -894,8 +876,7 @@ AddPlayerPostInit(function(inst)
 
         local product_prefab = HARVEST_PRODUCTS[target.prefab]
         local inventory_before = CountInventoryItem(inst, product_prefab)
-        local action = G.BufferedAction(inst, target, G.ACTIONS.PICK,
-            nil, nil, nil, 2, nil, nil, 1.5)
+        local action = G.BufferedAction(inst, target, G.ACTIONS.PICK)
         pick.action = action
         action:AddSuccessAction(function()
             local harvested = not target:IsValid() or (target.components.pickable ~= nil
@@ -954,7 +935,7 @@ AddPlayerPostInit(function(inst)
             or target.components.inventoryitem.owner ~= nil
             or not target.components.inventoryitem.canbepickedup
             or not G.CanEntitySeeTarget(inst, target)
-            or inst:GetDistanceSqToInst(target) > 64
+            or inst:GetDistanceSqToInst(target) > 256
             or inventory == nil or inventory:IsFull() or locomotor == nil then
             SetPickStatus(pickup, "rejected_target")
             return
@@ -1239,14 +1220,6 @@ AddPlayerPostInit(function(inst)
         local replace_now = G.TheWorld.state.phase == "night"
             and hand ~= nil and hand.prefab == "torch"
             and TorchSeconds(hand, true) <= 3
-        if active_pick ~= nil and active_pick.status == "started"
-            and active_pick.preview_id ~= nil then
-            local target = G.Ents[active_pick.target_guid]
-            if target == nil or not target:IsValid()
-                or inst:GetDistanceSqToInst(target) <= 4 then
-                StopPickPreview(active_pick)
-            end
-        end
         if survival_seen and (night_soon or dark_now or replace_now) and inventory ~= nil
             and not inst:HasTag("playerghost")
             and (last_local_light_at == nil or G.GetTime() - last_local_light_at >= 3) then
@@ -1410,7 +1383,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.22.0",
+            mod_version = "0.23.0",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,
