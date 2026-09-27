@@ -715,6 +715,24 @@ class SurvivalPlannerTests(unittest.TestCase):
         self.assertEqual(choice["items"][0]["guid"], 801)
         self.assertEqual({item["guid"] for item in choice["items"]}, {801, 802})
 
+    def test_ocean_seed_is_ignored_for_land_carrot(self):
+        planner = SurvivalPlanner()
+        state = observation(local_entities=[
+            {"guid": 803, "prefab": "seeds", "kind": "pickup", "ready": True,
+             "passable": False, "dx": 1, "dz": 0, "marsh_steps": 0},
+            {"guid": 804, "prefab": "carrot_planted", "kind": "harvest",
+             "ready": True, "passable": True, "dx": 5, "dz": 0,
+             "marsh_steps": 0}],
+            inventory={"counts": {"cutgrass": 10, "twigs": 10, "torch": 2},
+                       "free_slots": 12, "food_ready_hunger": 0, "hand": None},
+            vitals={"health": {"current": 150},
+                    "hunger": {"current": 40},
+                    "sanity": {"current": 200, "max": 200}})
+        planner.start(state)
+        choice = planner.on_observation(state, "epoch")
+        self.assertEqual(choice["type"], "PICK_TARGET")
+        self.assertEqual(choice["target_guid"], 804)
+
     def test_loot_cluster_uses_one_command_for_nearby_items(self):
         planner = SurvivalPlanner()
         supplies = {"cutgrass": 8, "twigs": 8, "torch": 2}

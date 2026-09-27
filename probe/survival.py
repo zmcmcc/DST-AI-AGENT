@@ -259,7 +259,9 @@ class SurvivalPlanner:
                     free_slots = inventory.get("free_slots", 15)
                     for target in observation.get("local_entities") or []:
                         kind = target.get("kind")
-                        if kind not in ("pickup", "harvest") or target.get("ready") is not True:
+                        if (kind not in ("pickup", "harvest")
+                                or target.get("ready") is not True
+                                or target.get("passable") is False):
                             continue
                         prefab = target.get("prefab")
                         if (prefab in ("flint", "rocks", "goldnugget", "smallmeat")
@@ -369,7 +371,8 @@ class SurvivalPlanner:
         available = []
         for entry in area["items"]:
             item = visible.get(entry["guid"])
-            if (item is not None and item.get("prefab") == entry["prefab"]
+            if (item is not None and item.get("passable") is not False
+                    and item.get("prefab") == entry["prefab"]
                     and item.get("kind") == entry["kind"]
                     and self.avoid_targets.get(entry["guid"], 0) <= now
                     and not self._route_near_hazard(observation, item)):
@@ -741,6 +744,7 @@ class SurvivalPlanner:
             loose_log = next((entity for entity in nearby
                               if entity.get("prefab") == "log"
                               and entity.get("ready") is True
+                              and entity.get("passable") is not False
                               and self.avoid_targets.get(entity.get("guid"), 0) <= now), None)
             if loose_log is not None:
                 return self._resource_choice("wood", loose_log, observation)
@@ -792,6 +796,9 @@ class SurvivalPlanner:
                      f"(owned={counts.get(target.get('prefab'), 0)})")
             if target.get("ready") is not True:
                 rejected.append(f"{label}=NOT_READY")
+                continue
+            if target.get("passable") is False:
+                rejected.append(f"{label}=UNREACHABLE_TERRAIN")
                 continue
             if self.avoid_targets.get(target.get("guid"), 0) > now:
                 rejected.append(f"{label}=RECENT_FAILURE_COOLDOWN")

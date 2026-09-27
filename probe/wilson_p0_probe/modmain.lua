@@ -227,12 +227,12 @@ local FRONTIER_DIRECTIONS = {
 
 local function ReadRouteTerrain(x, z, dx, dz)
     local map = G.TheWorld.Map
-    local steps = G.math.max(1, G.math.ceil(G.math.sqrt(dx * dx + dz * dz) / 4))
+    local steps = G.math.max(1, G.math.ceil(G.math.sqrt(dx * dx + dz * dz) / 2))
     local passable = true
     local marsh_steps = 0
     for step = 1, steps do
         local px, pz = x + dx * step / steps, z + dz * step / steps
-        if not map:IsPassableAtPoint(px, 0, pz) then
+        if not map:IsPassableAtPoint(px, 0, pz, false, true) then
             passable = false
         end
         if map:GetTileAtPoint(px, 0, pz) == G.WORLD_TILES.MARSH then
@@ -240,6 +240,13 @@ local function ReadRouteTerrain(x, z, dx, dz)
         end
     end
     return passable, marsh_steps
+end
+
+local function CanReachTargetOnFoot(inst, target)
+    local tx, _, tz = target.Transform:GetWorldPosition()
+    local map = G.TheWorld.Map
+    return map:IsPassableAtPoint(tx, 0, tz, false, true)
+        and not map:IsOceanAtPoint(tx, 0, tz, true)
 end
 
 local function ReadFrontier(x, z)
@@ -309,7 +316,11 @@ local function ReadLocalEntities(inst, x, z)
 
     local nearby, included, seen_prefabs = {}, {}, {}
     local function Include(entity)
-        local passable, marsh_steps = ReadRouteTerrain(x, z, entity.dx, entity.dz)
+        local _, marsh_steps = ReadRouteTerrain(x, z, entity.dx, entity.dz)
+        local tx, tz = x + entity.dx, z + entity.dz
+        local map = G.TheWorld.Map
+        local passable = map:IsPassableAtPoint(tx, 0, tz, false, true)
+            and not map:IsOceanAtPoint(tx, 0, tz, true)
         nearby[#nearby + 1] = {
             guid = entity.guid,
             prefab = entity.prefab,
@@ -317,6 +328,7 @@ local function ReadLocalEntities(inst, x, z)
             dz = entity.dz,
             ready = entity.ready,
             kind = entity.kind,
+            passable = passable,
             marsh_steps = marsh_steps,
         }
         included[entity.guid] = true
@@ -617,6 +629,16 @@ AddPlayerPostInit(function(inst)
         end
         pick.approach_started_at = G.GetTime()
         pick.native_action_started_at = G.GetTime()
+        local action_name = action.action == G.ACTIONS.PICK and "PICK"
+            or action.action == G.ACTIONS.PICKUP and "PICKUP"
+            or action.action == G.ACTIONS.CHOP and "CHOP" or nil
+        if action_name ~= nil and inst:GetDistanceSqToInst(target) > 2.25 then
+            local tx, _, tz = target.Transform:GetWorldPosition()
+            pick.preview_sequence = (pick.preview_sequence or 0) + 1
+            pick.preview_id = -pick.id * 1000 - pick.preview_sequence
+            SendClientMove("move_start", pick.epoch, pick.preview_id,
+                tx, tz, action_name, target.GUID)
+        end
         if pick.type == "FELL_TREE" and pick.previous_chop_success_at ~= nil then
             G.print("[Wilson chop] id=" .. pick.id .. " next_push_gap="
                 .. G.tostring(pick.native_action_started_at
@@ -630,7 +652,7 @@ AddPlayerPostInit(function(inst)
                 .. " dest=" .. G.tostring(locomotor.dest)
                 .. " loco_action=" .. G.tostring(locomotor.bufferedaction)
                 .. " inst_action=" .. G.tostring(inst:GetBufferedAction())
-                .. " client_preview=none")
+                .. " client_preview=" .. G.tostring(pick.preview_id ~= nil))
         end
         local ok, result = G.pcall(locomotor.PushAction, locomotor, action, false)
         if pick.native_probe then
@@ -645,7 +667,39 @@ AddPlayerPostInit(function(inst)
             and locomotor.bufferedaction ~= action
             and inst:GetBufferedAction() ~= action)) then
             pick.failure_reason = "native_push_rejected:" .. G.tostring(result)
+            StopPickPreview(pick)
             on_failed()
+            return
+        end
+        local last_distance = G.math.sqrt(inst:GetDistanceSqToInst(target))
+        local last_progress_at = G.GetTime()
+        local function check_progress()
+            if active_pick ~= pick or pick.status ~= "started"
+                or pick.action ~= action or not target:IsValid() then
+                return
+            end
+            local distance = G.math.sqrt(inst:GetDistanceSqToInst(target))
+            if distance + 0.25 < last_distance then
+                last_distance = distance
+                last_progress_at = G.GetTime()
+            end
+            if distance > 2 and G.GetTime() - last_progress_at >= 2.5
+                and not locomotor:WaitingForPathSearch() then
+                pick.failure_reason = "stalled_route"
+                StopPickPreview(pick)
+                pick.action = nil
+                on_failed("failed_unreachable")
+                if locomotor.bufferedaction == action
+                    or inst:GetBufferedAction() == action then
+                    locomotor:Clear()
+                    locomotor:Stop()
+                end
+            else
+                inst:DoTaskInTime(0.5, check_progress)
+            end
+        end
+        if pick.status == "started" then
+            inst:DoTaskInTime(0.5, check_progress)
         end
     end
 
@@ -925,6 +979,7 @@ AddPlayerPostInit(function(inst)
             or target.components.pickable == nil
             or not target.components.pickable:CanBePicked()
             or not G.CanEntitySeeTarget(inst, target)
+            or not CanReachTargetOnFoot(inst, target)
             or inst:GetDistanceSqToInst(target) > (auto_pick and 256 or 9) then
             SetPickStatus(pick, "rejected_target")
             return
@@ -968,8 +1023,8 @@ AddPlayerPostInit(function(inst)
         SetPickStatus(pick, "started")
         pick.behavior_started_at = G.GetTime()
         SayIntent(command, "我去采些资源")
-        PushTargetAction(pick, target, action, function()
-            SetPickStatus(pick, "failed_native_start")
+        PushTargetAction(pick, target, action, function(status)
+            SetPickStatus(pick, status or "failed_native_start")
         end)
         inst:DoTaskInTime(auto_pick and 10 or 6, function()
             if inst:IsValid() and active_pick == pick and pick.status == "started" then
@@ -1006,6 +1061,7 @@ AddPlayerPostInit(function(inst)
             or target.components.inventoryitem.owner ~= nil
             or not target.components.inventoryitem.canbepickedup
             or not G.CanEntitySeeTarget(inst, target)
+            or not CanReachTargetOnFoot(inst, target)
             or inst:GetDistanceSqToInst(target) > 256
             or inventory == nil or inventory:IsFull() or locomotor == nil then
             SetPickStatus(pickup, "rejected_target")
@@ -1032,8 +1088,8 @@ AddPlayerPostInit(function(inst)
         SetPickStatus(pickup, "started")
         pickup.behavior_started_at = G.GetTime()
         SayIntent(command, "我去捡些资源")
-        PushTargetAction(pickup, target, action, function()
-            SetPickStatus(pickup, "failed_native_start")
+        PushTargetAction(pickup, target, action, function(status)
+            SetPickStatus(pickup, status or "failed_native_start")
         end)
         inst:DoTaskInTime(10, function()
             if inst:IsValid() and active_pick == pickup and pickup.status == "started" then
@@ -1111,6 +1167,7 @@ AddPlayerPostInit(function(inst)
                         and entity.components.inventoryitem.owner == nil
                         and entity.components.inventoryitem.canbepickedup))
                     and G.CanEntitySeeTarget(inst, entity)
+                    and CanReachTargetOnFoot(inst, entity)
                     and inst:GetDistanceSqToInst(entity) <= 256 then
                     entry, target = candidate, entity
                     break
@@ -1155,7 +1212,7 @@ AddPlayerPostInit(function(inst)
             end)
             PushTargetAction(cluster, target, action, function()
                 G.print("[Wilson P0] cluster id=" .. cluster.id
-                    .. " approach failed target=" .. entry.guid)
+                    .. " action failed target=" .. entry.guid)
                 inst:DoTaskInTime(0, next_pick)
             end)
         end
@@ -1206,6 +1263,7 @@ AddPlayerPostInit(function(inst)
             or workable:GetWorkAction() ~= G.ACTIONS.CHOP
             or hand == nil or hand.prefab ~= "axe"
             or not G.CanEntitySeeTarget(inst, target)
+            or not CanReachTargetOnFoot(inst, target)
             or inst:GetDistanceSqToInst(target) > 64
             or locomotor == nil or HasVisibleThreat(inst, SENSE_RADIUS) then
             SetPickStatus(chop, "rejected_target")
@@ -1255,6 +1313,7 @@ AddPlayerPostInit(function(inst)
                     .. " since_push=" .. G.tostring(callback_at
                         - (chop.native_action_started_at or callback_at)))
                 chop.action_success_at = callback_at
+                StopPickPreview(chop)
                 chop.previous_chop_success_at = callback_at
                 local after_workable = target:IsValid() and target.components.workable or nil
                 local after = after_workable ~= nil
@@ -1276,8 +1335,8 @@ AddPlayerPostInit(function(inst)
                     SetPickStatus(chop, "failed_or_interrupted")
                 end
             end)
-            PushTargetAction(chop, target, action, function()
-                SetPickStatus(chop, "failed_native_start")
+            PushTargetAction(chop, target, action, function(status)
+                SetPickStatus(chop, status or "failed_native_start")
             end)
         end
         SetPickStatus(chop, "started")
@@ -1560,7 +1619,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.25.2",
+            mod_version = "0.25.3",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,
