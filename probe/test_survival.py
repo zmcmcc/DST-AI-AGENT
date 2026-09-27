@@ -460,6 +460,20 @@ class SurvivalPlannerTests(unittest.TestCase):
         planner._remember(observation())
         self.assertEqual(planner.safety_mode, "NORMAL")
 
+    def test_recovery_continues_moving_away_from_nearby_frog(self):
+        planner = SurvivalPlanner()
+        planner.start(observation())
+        planner._remember(observation(visible_threat_within_8=True,
+            nearest_threat={"prefab": "frog", "dx": 3, "dz": 0}))
+        near = observation(visible_hazards=[
+            {"prefab": "frog", "dx": 5, "dz": 0, "distance_sq": 25}],
+            frontier=[{"dx": -18, "dz": 0, "passable": True, "marsh_steps": 0}])
+        planner._remember(near)
+        self.assertEqual(planner.safety_mode, "RECOVER")
+        choice = planner._choose(near)
+        self.assertEqual(choice["type"], "MOVE_TO_POINT")
+        self.assertTrue(choice["escape"])
+
     def test_escape_uses_long_leg_and_remembers_danger(self):
         planner = SurvivalPlanner()
         danger = observation(visible_threat_within_8=True,

@@ -302,7 +302,8 @@ class SurvivalPlanner:
             self.completed += 1
             if self.action_type == "MOVE_TO_POINT" and self.action_point is not None:
                 self._mark_visit(*self.action_point)
-        elif status not in ("stopped", "interrupted_threat", "interrupted_light"):
+        elif status not in ("stopped", "interrupted_threat", "interrupted_light",
+                            "interrupted_marsh"):
             self.failed += 1
             if self.action_type in ("EAT_FOOD", "CRAFT_TORCH", "CRAFT_AXE",
                                     "BUILD_CAMPFIRE", "COOK_AT", "ADD_FUEL",
@@ -325,7 +326,8 @@ class SurvivalPlanner:
                                                           pz + 5 * dz / length))
         if status == "interrupted_threat" and self.action_target is not None:
             self.avoid_targets[self.action_target] = time.monotonic() + 20
-        if status in ("interrupted_threat", "interrupted_light", "stopped") and self.collect_area:
+        if status in ("interrupted_threat", "interrupted_light", "interrupted_marsh",
+                      "stopped") and self.collect_area:
             self._end_area("SAFETY_INTERRUPT")
         if self.action_type == "COLLECT_AREA" and self.collect_area is not None:
             self._end_area(status.upper())
@@ -567,6 +569,10 @@ class SurvivalPlanner:
         if self.safety_mode == "EVADE":
             return self._escape(observation)
         if self.safety_mode == "RECOVER":
+            if self.safety_clear_since is None:
+                choice = self._escape(observation)
+                if choice is not None:
+                    return choice
             self.reason = "recovering_from_threat"
             return None
         if observation.get("visible_threat_within_8") is not False:
@@ -1008,6 +1014,10 @@ class SurvivalPlanner:
 
     def _escape(self, observation):
         threat = observation.get("nearest_threat") or {}
+        if not threat:
+            hazards = observation.get("visible_hazards") or []
+            threat = min(hazards, key=lambda item: item.get("distance_sq",
+                         item.get("dx", 99) ** 2 + item.get("dz", 99) ** 2)) if hazards else {}
         dx, dz = threat.get("dx"), threat.get("dz")
         x, z = observation.get("x"), observation.get("z")
         if not all(isinstance(value, (int, float)) for value in (x, z, dx, dz)):
