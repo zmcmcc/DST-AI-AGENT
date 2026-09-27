@@ -10,7 +10,7 @@
 2. 进入世界后自主模式自动开始。`curl http://127.0.0.1:8765/survival/status` 可看当前目标和完成数；`curl -X POST http://127.0.0.1:8765/survival/stop` 可停止本轮世界的自主模式。
 3. 桥接日志写入 `probe/bridge.out.log`；在项目目录用 `tail -f probe/bridge.out.log` 查看。游戏内气泡仍会显示角色行动意图。
 
-下一轮先运行独立原生采摘基准，确认 `Locomotor:PushAction` 的远距离目标动作结果。游戏内气泡说明当前意图；桥接日志记录候选分数、过滤原因、动作回执和时序。`/survival/status` 在首夜结束后记录生存结果、夜间有光和无光的采样次数。
+进入世界后普通自主模式照常启动。白天自主模式选中 8～12 单位外的草时，桥接端会自动用原生 `Locomotor:PushAction` 执行并累计至多 10 次试验；无需额外指令或回复。`/native-benchmark/status` 可查看记录。游戏内气泡说明当前意图；桥接日志记录候选分数、过滤原因、动作回执和时序。`/survival/status` 在首夜结束后记录生存结果、夜间有光和无光的采样次数。
 
 ## P0 探针
 

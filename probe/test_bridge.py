@@ -32,7 +32,8 @@ class BridgeSurvivalTests(unittest.TestCase):
         bridge.pending_deadline = None
         bridge.latest_observation = None
         bridge.auto_enabled = False
-        bridge.native_benchmark.update(enabled=False, guid=None, running_id=None,
+        bridge.native_benchmark.update(enabled=False, background=False,
+                                       guid=None, running_id=None,
                                        target_guid=None, attempts=[], avoid={}, reason="off")
         bridge.survival = bridge.SurvivalPlanner()
         bridge.autostart_guids.clear()
@@ -129,6 +130,23 @@ class BridgeSurvivalTests(unittest.TestCase):
                        "native_action_started_at": 3.0, "terminal_at": 5.0})})
         self.assertEqual(bridge.native_benchmark["attempts"][0]["status"], "completed")
         self.assertEqual(bridge.native_benchmark["attempts"][0]["terminal_at"], 5.0)
+
+    def test_autonomous_world_runs_native_probe_without_manual_start(self):
+        grass = {"guid": 601, "prefab": "grass", "kind": "harvest",
+                 "ready": True, "dx": 9, "dz": 0, "marsh_steps": 0}
+        inventory = {"counts": {}, "free_slots": 10, "hand": None}
+        first = {"probe": "wilson-p0", "mod_version": bridge.MOD_VERSION,
+                 **observation(seq=1, local_entities=[grass], inventory=inventory)}
+        command = self.request("/probe", first)["command"]
+        self.assertTrue(bridge.survival.enabled)
+        self.assertTrue(bridge.native_benchmark["background"])
+        self.assertEqual(command["type"], "PICK_TARGET")
+        self.assertTrue(command["native_probe"])
+        self.request("/probe", {"probe": "wilson-p0", **observation(seq=2,
+            local_entities=[], inventory={**inventory, "counts": {"cutgrass": 1}},
+            execution={"epoch": command["epoch"], "id": command["id"],
+                       "status": "completed", "inventory_delta": 1})})
+        self.assertEqual(len(bridge.native_benchmark["attempts"]), 1)
 
 
 if __name__ == "__main__":

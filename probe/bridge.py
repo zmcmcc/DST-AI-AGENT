@@ -32,7 +32,7 @@ auto_failed = 0
 auto_avoid_until = {}
 auto_reason = "off"
 survival = SurvivalPlanner()
-native_benchmark = {"enabled": False, "guid": None, "running_id": None,
+native_benchmark = {"enabled": False, "background": False, "guid": None, "running_id": None,
                     "target_guid": None, "attempts": [], "avoid": {},
                     "reason": "off"}
 
@@ -143,7 +143,8 @@ class ProbeHandler(BaseHTTPRequestHandler):
                                for name in ("execution", "movement", "utility"))):
                     self.send_error(409, "stop survival and wait for idle Wilson")
                     return
-                native_benchmark.update(enabled=True, guid=last_guid, running_id=None,
+                native_benchmark.update(enabled=True, background=False,
+                                        guid=last_guid, running_id=None,
                                         target_guid=None, attempts=[], avoid={},
                                         reason="waiting_for_target")
                 autostart_guids.add(last_guid)
@@ -155,6 +156,7 @@ class ProbeHandler(BaseHTTPRequestHandler):
         if self.path == "/native-benchmark/stop":
             with lock:
                 native_benchmark["enabled"] = False
+                native_benchmark["background"] = False
                 native_benchmark["reason"] = "stopped"
                 status = native_benchmark_status()
             self.send_json(status)
@@ -190,6 +192,9 @@ class ProbeHandler(BaseHTTPRequestHandler):
             with lock:
                 running_id = survival.action_id if survival.enabled else None
                 survival.stop()
+                if native_benchmark["background"]:
+                    native_benchmark["enabled"] = False
+                    native_benchmark["reason"] = "survival_stopped"
                 if last_guid is not None:
                     autostart_guids.add(last_guid)
                 if (last_guid is not None and last_seen_at is not None
@@ -359,9 +364,11 @@ class ProbeHandler(BaseHTTPRequestHandler):
             if new_session:
                 autostart_guids.discard(new_guid)
                 native_benchmark["enabled"] = False
+                native_benchmark["background"] = False
                 native_benchmark["reason"] = "new_session"
             if last_guid != new_guid:
                 native_benchmark["enabled"] = False
+                native_benchmark["background"] = False
                 native_benchmark["reason"] = "player_changed"
                 last_action_id = None
                 if pending_command is not None and pending_command["guid"] != new_guid:
@@ -438,7 +445,8 @@ class ProbeHandler(BaseHTTPRequestHandler):
                 if len(native_benchmark["attempts"]) >= 10:
                     native_benchmark["enabled"] = False
                     native_benchmark["reason"] = "completed_10_trials"
-            if (native_benchmark["enabled"] and pending_command is None
+            if (native_benchmark["enabled"] and not native_benchmark["background"]
+                    and pending_command is None
                     and native_benchmark["running_id"] is None
                     and all((message.get(name) or {}).get("status") != "started"
                             for name in ("execution", "movement", "utility"))):
@@ -507,6 +515,10 @@ class ProbeHandler(BaseHTTPRequestHandler):
                 try:
                     survival.start(message)
                     autostart_guids.add(new_guid)
+                    native_benchmark.update(enabled=True, background=True,
+                                            guid=new_guid, running_id=None,
+                                            target_guid=None, attempts=[], avoid={},
+                                            reason="watching_autonomous_actions")
                     print(f"survival auto-started guid={new_guid}", flush=True)
                 except ValueError as error:
                     print(f"survival auto-start unavailable: {error}", flush=True)
@@ -519,6 +531,22 @@ class ProbeHandler(BaseHTTPRequestHandler):
                     "guid": last_guid,
                     **choice,
                 }
+                if (native_benchmark["enabled"] and native_benchmark["background"]
+                        and len(native_benchmark["attempts"]) < 10
+                        and choice["type"] == "PICK_TARGET"
+                        and choice.get("target_prefab") == "grass"):
+                    selected = next((item for item in message.get("local_entities") or []
+                                     if item.get("guid") == choice.get("target_guid")), None)
+                    if selected is not None:
+                        candidate, _ = select_native_benchmark_target({
+                            **message, "local_entities": [selected]})
+                        if candidate is not None:
+                            command["native_probe"] = True
+                            native_benchmark["running_id"] = next_command_id
+                            native_benchmark["target_guid"] = selected["guid"]
+                            native_benchmark["reason"] = "trial_running"
+                            print(f"native benchmark autonomous trial id={next_command_id} "
+                                  f"target={selected['guid']}", flush=True)
                 pending_command = command
                 pending_deadline = time.monotonic() + 5
                 if choice["type"] != "STOP":

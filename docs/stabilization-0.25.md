@@ -13,4 +13,4 @@
 | 前两天沼泽 | 规划器、命令接收端和断桥本地逃跑拒绝已知沼泽路线；误入时 Lua 返回最近非沼泽位置。实际 pathfinder 轨迹仍需实机核对。 |
 | A～E micro-benchmark | A 的自动探针已备；A～E 均待实机。 |
 
-原生采摘基准：先由桥接端停止自主模式，待角色空闲；调用 `POST /native-benchmark/start`。威尔逊白天、安全、生命和饥饿均不低于 75 且背包有空间时，探针寻找 8～12 单位外可采的草。找到就连续提交原生动作，总共记录 10 次；找不到时状态为 `waiting_for_grass_8_to_12`，可人工移动至下一片草旁。读取 `GET /native-benchmark/status` 查看每次终态。服务端日志有 `[Wilson native]` 和 `[Wilson timeline]`。本轮要求核对自动接近、动作衔接和每次失败原因，不以 Python 单元测试代替实机结果。
+进入世界后普通自主模式自动启动。它选中白天、8～12 单位外、安全的草时，桥接端自动将这次采摘记入原生动作基准，最多累计 10 次；其他行动照常进行，无需用户回复或手动启动。`GET /native-benchmark/status` 返回逐次终态，服务端日志有 `[Wilson native]` 和 `[Wilson timeline]`。独立基准入口 `POST /native-benchmark/start` 仍供开发者在停止自主模式后单独隔离复现。实机要求核对自动接近、动作衔接和每次失败原因，不以 Python 单元测试代替实机结果。
