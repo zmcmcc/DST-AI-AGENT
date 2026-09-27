@@ -718,6 +718,7 @@ AddPlayerPostInit(function(inst)
                 G.print("[Wilson timeline] id=" .. pick.id
                     .. " behavior_started=" .. G.tostring(pick.behavior_started_at)
                     .. " approach_started=" .. G.tostring(pick.approach_started_at)
+                    .. " interaction_range=" .. G.tostring(pick.arrived_interaction_range_at)
                     .. " native_started=" .. G.tostring(pick.native_action_started_at)
                     .. " action_success=" .. G.tostring(pick.action_success_at)
                     .. " action_failed=" .. G.tostring(pick.action_failed_at)
@@ -941,6 +942,7 @@ AddPlayerPostInit(function(inst)
             server_received_at = G.GetTime(),
             chosen_at = command.chosen_at,
             command_sent_at = command.command_sent_at,
+            native_probe = command.native_probe == true,
         }
         active_pick = pick
         local target = G.Ents[command.target_guid]
@@ -1349,11 +1351,30 @@ AddPlayerPostInit(function(inst)
         end)
     end
 
+    inst:ListenForEvent("actionfailed", function(_, data)
+        if active_pick ~= nil and active_pick.status == "started"
+            and data ~= nil and data.action == active_pick.action then
+            active_pick.failure_reason = G.tostring(data.reason)
+            G.print("[Wilson actionfailed] id=" .. active_pick.id
+                .. " reason=" .. active_pick.failure_reason
+                .. " t=" .. G.tostring(G.GetTime()))
+        end
+    end)
+
     inst:DoPeriodicTask(0.5, function()
         local frog_visible, threat_visible, nearest_threat, visible_hazards =
             ReadVisibleHazards(inst, HAZARD_OBSERVE_RADIUS)
         local locomotor = inst.components.locomotor
         local inventory = inst.components.inventory
+        if active_pick ~= nil and active_pick.status == "started"
+            and active_pick.arrived_interaction_range_at == nil
+            and active_pick.target_guid ~= nil then
+            local target = G.Ents[active_pick.target_guid]
+            if target ~= nil and target:IsValid()
+                and inst:GetDistanceSqToInst(target) <= 4 then
+                active_pick.arrived_interaction_range_at = G.GetTime()
+            end
+        end
         local px, _, pz = inst.Transform:GetWorldPosition()
         local on_marsh = G.TheWorld.Map:GetTileAtPoint(px, 0, pz)
             == G.WORLD_TILES.MARSH
@@ -1644,6 +1665,7 @@ AddPlayerPostInit(function(inst)
                 native_action_started_at = active_pick.native_action_started_at,
                 action_success_at = active_pick.action_success_at,
                 action_failed_at = active_pick.action_failed_at,
+                arrived_interaction_range_at = active_pick.arrived_interaction_range_at,
                 terminal_at = active_pick.terminal_at,
                 chosen_at = active_pick.chosen_at,
                 command_sent_at = active_pick.command_sent_at,

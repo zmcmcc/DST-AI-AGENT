@@ -424,6 +424,7 @@ class ProbeHandler(BaseHTTPRequestHandler):
                     "failure_reason": execution.get("failure_reason"),
                     "server_received_at": execution.get("server_received_at"),
                     "native_action_started_at": execution.get("native_action_started_at"),
+                    "arrived_interaction_range_at": execution.get("arrived_interaction_range_at"),
                     "action_success_at": execution.get("action_success_at"),
                     "action_failed_at": execution.get("action_failed_at"),
                     "terminal_at": execution.get("terminal_at"),
