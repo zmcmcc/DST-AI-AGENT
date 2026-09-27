@@ -11,7 +11,7 @@ from survival import SurvivalPlanner
 
 lock = threading.Lock()
 bridge_epoch = uuid.uuid4().hex
-MOD_VERSION = "0.25.1"
+MOD_VERSION = "0.25.2"
 autostart_guids = set()
 last_guid = None
 last_seq = None

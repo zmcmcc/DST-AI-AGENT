@@ -259,7 +259,7 @@ class SurvivalPlannerTests(unittest.TestCase):
         self.assertEqual(choice["type"], "PICKUP_TARGET")
         self.assertEqual(choice["target_prefab"], "flint")
 
-    def test_does_not_detour_for_flint_three_units_away(self):
+    def test_picks_flint_three_units_away_before_grass_four_units_away(self):
         planner = SurvivalPlanner()
         state = observation(local_entities=[
             {"guid": 80, "prefab": "grass", "ready": True, "dx": 4, "dz": 0},
@@ -267,8 +267,8 @@ class SurvivalPlannerTests(unittest.TestCase):
         ])
         planner.start(state)
         choice = planner.on_observation(state, "epoch")
-        self.assertEqual(choice["type"], "PICK_TARGET")
-        self.assertEqual(choice["target_prefab"], "grass")
+        self.assertEqual(choice["type"], "PICKUP_TARGET")
+        self.assertEqual(choice["target_prefab"], "flint")
 
     def test_picks_morsel_but_does_not_treat_it_as_ready_food(self):
         planner = SurvivalPlanner()
@@ -699,6 +699,21 @@ class SurvivalPlannerTests(unittest.TestCase):
                 choice = planner.on_observation(state, "epoch")
                 self.assertEqual(choice["type"], "PICKUP_TARGET")
                 self.assertEqual(choice["target_prefab"], prefab)
+
+    def test_grass_at_feet_precedes_twig_five_units_away(self):
+        planner = SurvivalPlanner()
+        state = observation(local_entities=[
+            {"guid": 801, "prefab": "grass", "kind": "harvest", "ready": True,
+             "dx": 1, "dz": 0, "marsh_steps": 0},
+            {"guid": 802, "prefab": "twigs", "kind": "pickup", "ready": True,
+             "dx": 5, "dz": 0, "marsh_steps": 0}],
+            inventory={"counts": {"cutgrass": 2, "twigs": 0},
+                       "free_slots": 12, "hand": None})
+        planner.start(state)
+        choice = planner.on_observation(state, "epoch")
+        self.assertEqual(choice["type"], "COLLECT_AREA")
+        self.assertEqual(choice["items"][0]["guid"], 801)
+        self.assertEqual({item["guid"] for item in choice["items"]}, {801, 802})
 
     def test_loot_cluster_uses_one_command_for_nearby_items(self):
         planner = SurvivalPlanner()

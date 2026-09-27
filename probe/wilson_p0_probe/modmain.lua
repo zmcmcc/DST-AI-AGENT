@@ -599,83 +599,54 @@ AddPlayerPostInit(function(inst)
         end
     end
 
-    local function StartPickPreview(pick, target, preview_id)
-        if inst:GetDistanceSqToInst(target) <= 2.25 then
-            return
-        end
-        local px, _, pz = inst.Transform:GetWorldPosition()
-        local tx, _, tz = target.Transform:GetWorldPosition()
-        local dx, dz = px - tx, pz - tz
-        local length = G.math.sqrt(dx * dx + dz * dz)
-        if length > 0.01 then
-            pick.preview_id = preview_id or pick.id
-            SendClientMove("move_start", pick.epoch, pick.preview_id,
-                tx + dx / length, tz + dz / length)
-        end
-    end
-
-    local function PushApproachedAction(pick, target, action, preview_id, on_failed)
+    local function PushTargetAction(pick, target, action, on_failed)
         local locomotor = inst.components.locomotor
-        local function push()
-            if active_pick ~= pick or pick.status ~= "started" then
-                return
-            end
-            if not target:IsValid() then
-                on_failed()
-                return
-            end
-            pick.native_action_started_at = G.GetTime()
-            if pick.type == "FELL_TREE" and pick.previous_chop_success_at ~= nil then
-                G.print("[Wilson chop] id=" .. pick.id .. " next_push_gap="
-                    .. G.tostring(pick.native_action_started_at
-                        - pick.previous_chop_success_at))
-            end
-            local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
-            if not ok then
-                on_failed()
-            elseif pick.status == "started"
-                and locomotor.bufferedaction ~= action
-                and inst:GetBufferedAction() ~= action then
-                on_failed()
-            end
-        end
-        if inst:GetDistanceSqToInst(target) <= 4 then
-            push()
+        if active_pick ~= pick or pick.status ~= "started" then
             return
         end
-        local ok = G.pcall(locomotor.GoToEntity, locomotor, target, nil, false)
-        if not ok or locomotor.dest == nil then
+        if not target:IsValid() then
+            pick.failure_reason = "target_invalid"
             on_failed()
             return
         end
-        pick.approaching = true
-        pick.approach_started_at = G.GetTime()
-        pick.approach_dest = locomotor.dest
-        StartPickPreview(pick, target, preview_id)
-        local started = G.GetTime()
-        local function check_approach()
-            if active_pick ~= pick or pick.status ~= "started"
-                or pick.action ~= action or not pick.approaching then
-                return
-            end
-            if not target:IsValid() or G.GetTime() - started > 8
-                or (locomotor.dest ~= pick.approach_dest
-                    and inst:GetDistanceSqToInst(target) > 4) then
-                if locomotor.dest == pick.approach_dest then
-                    locomotor:Stop()
-                end
-                pick.approaching = false
-                StopPickPreview(pick)
-                on_failed()
-            elseif inst:GetDistanceSqToInst(target) <= 4 then
-                pick.approaching = false
-                StopPickPreview(pick)
-                push()
-            else
-                inst:DoTaskInTime(0.05, check_approach)
-            end
+        local valid, reason = action:IsValid()
+        if not valid then
+            pick.failure_reason = "invalid_action:" .. G.tostring(reason)
+            on_failed()
+            return
         end
-        inst:DoTaskInTime(0.05, check_approach)
+        pick.approach_started_at = G.GetTime()
+        pick.native_action_started_at = G.GetTime()
+        if pick.type == "FELL_TREE" and pick.previous_chop_success_at ~= nil then
+            G.print("[Wilson chop] id=" .. pick.id .. " next_push_gap="
+                .. G.tostring(pick.native_action_started_at
+                    - pick.previous_chop_success_at))
+        end
+        if pick.native_probe then
+            G.print("[Wilson native] before id=" .. pick.id
+                .. " valid=" .. G.tostring(valid)
+                .. " reason=" .. G.tostring(reason)
+                .. " distance=" .. G.tostring(G.math.sqrt(inst:GetDistanceSqToInst(target)))
+                .. " dest=" .. G.tostring(locomotor.dest)
+                .. " loco_action=" .. G.tostring(locomotor.bufferedaction)
+                .. " inst_action=" .. G.tostring(inst:GetBufferedAction())
+                .. " client_preview=none")
+        end
+        local ok, result = G.pcall(locomotor.PushAction, locomotor, action, false)
+        if pick.native_probe then
+            G.print("[Wilson native] after id=" .. pick.id
+                .. " pcall=" .. G.tostring(ok)
+                .. " result=" .. G.tostring(result)
+                .. " dest=" .. G.tostring(locomotor.dest)
+                .. " loco_action=" .. G.tostring(locomotor.bufferedaction)
+                .. " inst_action=" .. G.tostring(inst:GetBufferedAction()))
+        end
+        if pick.status == "started" and (not ok or (locomotor.dest == nil
+            and locomotor.bufferedaction ~= action
+            and inst:GetBufferedAction() ~= action)) then
+            pick.failure_reason = "native_push_rejected:" .. G.tostring(result)
+            on_failed()
+        end
     end
 
     local function StopPickMotion(pick)
@@ -997,38 +968,9 @@ AddPlayerPostInit(function(inst)
         SetPickStatus(pick, "started")
         pick.behavior_started_at = G.GetTime()
         SayIntent(command, "我去采些资源")
-        if command.native_probe == true then
-            local valid, reason = action:IsValid()
-            G.print("[Wilson native] before id=" .. pick.id
-                .. " t=" .. G.tostring(G.GetTime())
-                .. " valid=" .. G.tostring(valid)
-                .. " reason=" .. G.tostring(reason)
-                .. " target_valid=" .. G.tostring(target:IsValid())
-                .. " distance=" .. G.tostring(G.math.sqrt(inst:GetDistanceSqToInst(target)))
-                .. " dest=" .. G.tostring(locomotor.dest)
-                .. " loco_action=" .. G.tostring(locomotor.bufferedaction)
-                .. " inst_action=" .. G.tostring(inst:GetBufferedAction())
-                .. " client_preview=none")
-            pick.native_action_started_at = G.GetTime()
-            local ok, result = G.pcall(locomotor.PushAction, locomotor, action, false)
-            G.print("[Wilson native] after id=" .. pick.id
-                .. " t=" .. G.tostring(G.GetTime())
-                .. " pcall=" .. G.tostring(ok)
-                .. " result=" .. G.tostring(result)
-                .. " dest=" .. G.tostring(locomotor.dest)
-                .. " loco_action=" .. G.tostring(locomotor.bufferedaction)
-                .. " inst_action=" .. G.tostring(inst:GetBufferedAction()))
-            if not ok or (locomotor.dest == nil
-                and locomotor.bufferedaction ~= action
-                and inst:GetBufferedAction() ~= action) then
-                pick.failure_reason = "native_push_rejected:" .. G.tostring(result)
-                SetPickStatus(pick, "failed_native_start")
-            end
-        else
-            PushApproachedAction(pick, target, action, nil, function()
-                SetPickStatus(pick, "failed_approach")
-            end)
-        end
+        PushTargetAction(pick, target, action, function()
+            SetPickStatus(pick, "failed_native_start")
+        end)
         inst:DoTaskInTime(auto_pick and 10 or 6, function()
             if inst:IsValid() and active_pick == pick and pick.status == "started" then
                 StopPickMotion(pick)
@@ -1090,8 +1032,8 @@ AddPlayerPostInit(function(inst)
         SetPickStatus(pickup, "started")
         pickup.behavior_started_at = G.GetTime()
         SayIntent(command, "我去捡些资源")
-        PushApproachedAction(pickup, target, action, nil, function()
-            SetPickStatus(pickup, "failed_approach")
+        PushTargetAction(pickup, target, action, function()
+            SetPickStatus(pickup, "failed_native_start")
         end)
         inst:DoTaskInTime(10, function()
             if inst:IsValid() and active_pick == pickup and pickup.status == "started" then
@@ -1211,8 +1153,7 @@ AddPlayerPostInit(function(inst)
                     inst:DoTaskInTime(0, next_pick)
                 end
             end)
-            PushApproachedAction(cluster, target, action,
-                command.id * 100 + cluster.index, function()
+            PushTargetAction(cluster, target, action, function()
                 G.print("[Wilson P0] cluster id=" .. cluster.id
                     .. " approach failed target=" .. entry.guid)
                 inst:DoTaskInTime(0, next_pick)
@@ -1335,8 +1276,8 @@ AddPlayerPostInit(function(inst)
                     SetPickStatus(chop, "failed_or_interrupted")
                 end
             end)
-            PushApproachedAction(chop, target, action, nil, function()
-                SetPickStatus(chop, "failed_approach")
+            PushTargetAction(chop, target, action, function()
+                SetPickStatus(chop, "failed_native_start")
             end)
         end
         SetPickStatus(chop, "started")
@@ -1619,7 +1560,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.25.1",
+            mod_version = "0.25.2",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,

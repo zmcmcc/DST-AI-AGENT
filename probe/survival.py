@@ -311,7 +311,9 @@ class SurvivalPlanner:
                 self.retry_after[self.action_type] = time.monotonic() + (
                     60 if self.action_type == "BUILD_CAMPFIRE" else 5)
             if self.action_target is not None:
-                self.avoid_targets[self.action_target] = time.monotonic() + 20
+                self.avoid_targets[self.action_target] = time.monotonic() + (
+                    3 if status in ("failed_approach", "failed_native_start",
+                                    "failed_or_interrupted") else 20)
             if (self.action_type == "MOVE_TO_POINT" and self.action_point is not None
                     and status in ("blocked", "timed_out", "blocked_or_timed_out",
                                    "rejected_point")):
@@ -830,7 +832,8 @@ class SurvivalPlanner:
                                ("berrybush", "berrybush2", "berrybush_juicy") else 0)
                 near_bonus = (0 if critical_hunger and resource != "food" else
                               8 if distance_sq <= 36 else 0)
-                score = priority + value_bonus + near_bonus - 0.7 * distance
+                score = (priority + value_bonus + near_bonus - 0.7 * distance
+                         + (20 - 0.5 * distance_sq if distance_sq <= 16 else 0))
                 candidates.append((-score, distance_sq, target["guid"], resource, target))
             if target.get("kind") == "pickup" and not matched:
                 offer = loose_item_offer(target.get("prefab"),
@@ -838,7 +841,9 @@ class SurvivalPlanner:
                                          free_slots, distance)
                 if offer is not None:
                     priority, _ = offer
-                    score = priority + (8 if distance_sq <= 36 else 0) - 0.7 * distance
+                    score = (priority + (8 if distance_sq <= 36 else 0)
+                             - 0.7 * distance
+                             + (20 - 0.5 * distance_sq if distance_sq <= 16 else 0))
                     candidates.append((-score, distance_sq, target["guid"], "loot", target))
                 else:
                     desired = ITEM_CATALOG.get(target.get("prefab"), (None, 1, 1, 3))[1]
