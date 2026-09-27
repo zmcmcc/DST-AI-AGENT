@@ -485,14 +485,6 @@ AddClientModRPCHandler(CLIENT_MOVE_NAMESPACE, "move_start", function(epoch, id, 
     local action = target ~= nil and target:IsValid() and action_type ~= nil
         and G.BufferedAction(player, target, action_type)
         or G.BufferedAction(player, nil, G.ACTIONS.WALKTO, nil, G.Vector3(x, 0, z))
-    if action_type ~= nil and target ~= nil and target:IsValid() then
-        action.preview_cb = function()
-            local controller = player.components.playercontroller
-            if controller ~= nil then
-                controller:RemoteActionButton(action, true)
-            end
-        end
-    end
     local ok = G.pcall(locomotor.PreviewAction, locomotor, action, false)
     if ok then
         client_move = {key = key, owned_dest = locomotor.dest}
@@ -636,54 +628,49 @@ AddPlayerPostInit(function(inst)
             return
         end
         pick.approach_started_at = G.GetTime()
-        if pick.native_probe then
-            pick.native_action_started_at = G.GetTime()
-            local ok, result = G.pcall(locomotor.PushAction, locomotor, action, false)
-            if pick.status == "started" and (not ok or (locomotor.dest == nil
-                and locomotor.bufferedaction ~= action
-                and inst:GetBufferedAction() ~= action)) then
-                pick.failure_reason = "native_push_rejected:" .. G.tostring(result)
-                on_failed()
-            end
-            return
-        end
+        pick.native_action_started_at = G.GetTime()
         local action_name = action.action == G.ACTIONS.PICK and "PICK"
             or action.action == G.ACTIONS.PICKUP and "PICKUP"
             or action.action == G.ACTIONS.CHOP and "CHOP" or nil
-        if action_name == nil or inst.userid == nil then
-            pick.failure_reason = "client_action_unavailable"
+        if action_name ~= nil and inst:GetDistanceSqToInst(target) > 2.25 then
+            local tx, _, tz = target.Transform:GetWorldPosition()
+            pick.preview_sequence = (pick.preview_sequence or 0) + 1
+            pick.preview_id = -pick.id * 1000 - pick.preview_sequence
+            SendClientMove("move_start", pick.epoch, pick.preview_id,
+                tx, tz, action_name, target.GUID)
+        end
+        if pick.type == "FELL_TREE" and pick.previous_chop_success_at ~= nil then
+            G.print("[Wilson chop] id=" .. pick.id .. " next_push_gap="
+                .. G.tostring(pick.native_action_started_at
+                    - pick.previous_chop_success_at))
+        end
+        if pick.native_probe then
+            G.print("[Wilson native] before id=" .. pick.id
+                .. " valid=" .. G.tostring(valid)
+                .. " reason=" .. G.tostring(reason)
+                .. " distance=" .. G.tostring(G.math.sqrt(inst:GetDistanceSqToInst(target)))
+                .. " dest=" .. G.tostring(locomotor.dest)
+                .. " loco_action=" .. G.tostring(locomotor.bufferedaction)
+                .. " inst_action=" .. G.tostring(inst:GetBufferedAction())
+                .. " client_preview=" .. G.tostring(pick.preview_id ~= nil))
+        end
+        local ok, result = G.pcall(locomotor.PushAction, locomotor, action, false)
+        if pick.native_probe then
+            G.print("[Wilson native] after id=" .. pick.id
+                .. " pcall=" .. G.tostring(ok)
+                .. " result=" .. G.tostring(result)
+                .. " dest=" .. G.tostring(locomotor.dest)
+                .. " loco_action=" .. G.tostring(locomotor.bufferedaction)
+                .. " inst_action=" .. G.tostring(inst:GetBufferedAction()))
+        end
+        if pick.status == "started" and (not ok or (locomotor.dest == nil
+            and locomotor.bufferedaction ~= action
+            and inst:GetBufferedAction() ~= action)) then
+            pick.failure_reason = "native_push_rejected:" .. G.tostring(result)
+            StopPickPreview(pick)
             on_failed()
             return
         end
-        if pick.action_observer ~= nil then
-            inst:RemoveEventCallback("performaction", pick.action_observer)
-        end
-        local function on_perform(_, data)
-            local actual = data ~= nil and data.action or nil
-            if active_pick == pick and pick.status == "started"
-                and pick.action == action and actual ~= nil
-                and actual.target == target and actual.action == action.action then
-                pick.native_action = actual
-                pick.native_action_started_at = G.GetTime()
-                for _, callback in G.ipairs(action.onsuccess) do
-                    actual:AddSuccessAction(callback)
-                end
-                for _, callback in G.ipairs(action.onfail) do
-                    actual:AddFailAction(callback)
-                end
-                inst:RemoveEventCallback("performaction", on_perform)
-                pick.action_observer = nil
-                G.print("[Wilson P0] client action id=" .. pick.id
-                    .. " target=" .. target.GUID .. " performed")
-            end
-        end
-        pick.action_observer = on_perform
-        inst:ListenForEvent("performaction", on_perform)
-        local tx, _, tz = target.Transform:GetWorldPosition()
-        pick.preview_sequence = (pick.preview_sequence or 0) + 1
-        pick.preview_id = -pick.id * 1000 - pick.preview_sequence
-        SendClientMove("move_start", pick.epoch, pick.preview_id,
-            tx, tz, action_name, target.GUID)
         local last_distance = G.math.sqrt(inst:GetDistanceSqToInst(target))
         local last_progress_at = G.GetTime()
         local function check_progress()
@@ -702,8 +689,8 @@ AddPlayerPostInit(function(inst)
                 StopPickPreview(pick)
                 pick.action = nil
                 on_failed("failed_unreachable")
-                if pick.native_action ~= nil and (locomotor.bufferedaction == pick.native_action
-                    or inst:GetBufferedAction() == pick.native_action) then
+                if locomotor.bufferedaction == action
+                    or inst:GetBufferedAction() == action then
                     locomotor:Clear()
                     locomotor:Stop()
                 end
@@ -718,14 +705,13 @@ AddPlayerPostInit(function(inst)
 
     local function StopPickMotion(pick)
         local locomotor = inst.components.locomotor
-        local action = pick.native_action or pick.action
         if locomotor ~= nil then
             if pick.approaching and pick.approach_dest ~= nil
                 and locomotor.dest == pick.approach_dest then
                 locomotor:Stop()
-            elseif action ~= nil and (locomotor.bufferedaction == action
-                or inst:GetBufferedAction() == action) then
-                if inst:GetBufferedAction() == action then
+            elseif pick.action ~= nil and (locomotor.bufferedaction == pick.action
+                or inst:GetBufferedAction() == pick.action) then
+                if inst:GetBufferedAction() == pick.action then
                     inst:ClearBufferedAction()
                 end
                 locomotor:Clear()
@@ -741,11 +727,6 @@ AddPlayerPostInit(function(inst)
             if status ~= "started" and status ~= "received"
                 and pick.preview_id ~= nil then
                 StopPickPreview(pick)
-            end
-            if status ~= "started" and status ~= "received"
-                and pick.action_observer ~= nil then
-                inst:RemoveEventCallback("performaction", pick.action_observer)
-                pick.action_observer = nil
             end
             if (pick.type == "LOOT_CLUSTER" or pick.type == "GATHER_PATCH"
                 or pick.type == "COLLECT_AREA")
@@ -1638,7 +1619,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.25.4",
+            mod_version = "0.25.3",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,
