@@ -11,7 +11,7 @@ from survival import SurvivalPlanner
 
 lock = threading.Lock()
 bridge_epoch = uuid.uuid4().hex
-MOD_VERSION = "0.25.3"
+MOD_VERSION = "0.25.4"
 autostart_guids = set()
 last_guid = None
 last_seq = None
@@ -515,10 +515,6 @@ class ProbeHandler(BaseHTTPRequestHandler):
                 try:
                     survival.start(message)
                     autostart_guids.add(new_guid)
-                    native_benchmark.update(enabled=True, background=True,
-                                            guid=new_guid, running_id=None,
-                                            target_guid=None, attempts=[], avoid={},
-                                            reason="watching_autonomous_actions")
                     print(f"survival auto-started guid={new_guid}", flush=True)
                 except ValueError as error:
                     print(f"survival auto-start unavailable: {error}", flush=True)
