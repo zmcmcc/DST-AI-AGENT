@@ -511,6 +511,8 @@ AddPlayerPostInit(function(inst)
     local last_bridge_ok_at = nil
     local last_local_escape_at = nil
     local last_local_light_at = nil
+    local last_local_marsh_at = nil
+    local last_safe_non_marsh_position = nil
     local local_move_id = 0
     local last_intent_goal = nil
     local last_intent_at = nil
@@ -555,6 +557,11 @@ AddPlayerPostInit(function(inst)
     local function SetMoveStatus(move, status)
         if active_move == move then
             move.status = status
+            if status == "started" then
+                move.behavior_started_at = G.GetTime()
+            else
+                move.terminal_at = G.GetTime()
+            end
             command_ack = {epoch = move.epoch, id = move.id, status = status}
             G.print("[Wilson P0] move id=" .. move.id .. " status=" .. status)
         end
@@ -567,8 +574,7 @@ AddPlayerPostInit(function(inst)
         local locomotor = inst.components.locomotor
         local own_move = locomotor ~= nil and move.owned_dest ~= nil
             and locomotor.dest == move.owned_dest
-        local coast = own_move and status == "arrived" and move.goal == "explore"
-        if own_move and not coast then
+        if own_move then
             locomotor:Stop()
         end
         local x, _, z = inst.Transform:GetWorldPosition()
@@ -577,13 +583,13 @@ AddPlayerPostInit(function(inst)
         move.distance_to_goal = G.math.sqrt((x - move.goal_x) ^ 2
             + (z - move.goal_z) ^ 2)
         SetMoveStatus(move, status)
-        if not coast then
-            SendClientMove("move_stop", move.epoch, move.id)
-        end
+        SendClientMove("move_stop", move.epoch, move.id)
         G.print("[Wilson P0] move id=" .. move.id
             .. " delta_x=" .. G.tostring(move.delta_x)
             .. " delta_z=" .. G.tostring(move.delta_z)
-            .. " remaining=" .. G.tostring(move.distance_to_goal))
+            .. " remaining=" .. G.tostring(move.distance_to_goal)
+            .. " started_at=" .. G.tostring(move.behavior_started_at)
+            .. " terminal_at=" .. G.tostring(move.terminal_at))
     end
 
     local function StopPickPreview(pick)
@@ -618,6 +624,12 @@ AddPlayerPostInit(function(inst)
                 on_failed()
                 return
             end
+            pick.native_action_started_at = G.GetTime()
+            if pick.type == "FELL_TREE" and pick.previous_chop_success_at ~= nil then
+                G.print("[Wilson chop] id=" .. pick.id .. " next_push_gap="
+                    .. G.tostring(pick.native_action_started_at
+                        - pick.previous_chop_success_at))
+            end
             local ok = G.pcall(locomotor.PushAction, locomotor, action, false)
             if not ok then
                 on_failed()
@@ -637,6 +649,7 @@ AddPlayerPostInit(function(inst)
             return
         end
         pick.approaching = true
+        pick.approach_started_at = G.GetTime()
         pick.approach_dest = locomotor.dest
         StartPickPreview(pick, target, preview_id)
         local started = G.GetTime()
@@ -700,9 +713,19 @@ AddPlayerPostInit(function(inst)
                     and "STOPPED" or status
             end
             pick.status = status
+            if status ~= "started" and status ~= "received" then
+                pick.terminal_at = G.GetTime()
+                G.print("[Wilson timeline] id=" .. pick.id
+                    .. " behavior_started=" .. G.tostring(pick.behavior_started_at)
+                    .. " approach_started=" .. G.tostring(pick.approach_started_at)
+                    .. " native_started=" .. G.tostring(pick.native_action_started_at)
+                    .. " action_success=" .. G.tostring(pick.action_success_at)
+                    .. " action_failed=" .. G.tostring(pick.action_failed_at)
+                    .. " terminal=" .. G.tostring(pick.terminal_at))
+            end
             command_ack = {epoch = pick.epoch, id = pick.id, status = status}
             G.print("[Wilson P0] pick id=" .. pick.id .. " target=" .. pick.target_guid
-                .. " status=" .. status)
+                .. " status=" .. status .. " t=" .. G.tostring(G.GetTime()))
         end
     end
 
@@ -915,6 +938,9 @@ AddPlayerPostInit(function(inst)
             type = "PICK_TARGET",
             target_guid = command.target_guid,
             status = "received",
+            server_received_at = G.GetTime(),
+            chosen_at = command.chosen_at,
+            command_sent_at = command.command_sent_at,
         }
         active_pick = pick
         local target = G.Ents[command.target_guid]
@@ -945,6 +971,7 @@ AddPlayerPostInit(function(inst)
         local action = G.BufferedAction(inst, target, G.ACTIONS.PICK)
         pick.action = action
         action:AddSuccessAction(function()
+            pick.action_success_at = G.GetTime()
             local harvested = not target:IsValid() or (target.components.pickable ~= nil
                 and not target.components.pickable:CanBePicked())
             pick.inventory_delta = CountInventoryItem(inst, product_prefab) - inventory_before
@@ -953,6 +980,7 @@ AddPlayerPostInit(function(inst)
         end)
         action:AddFailAction(function()
             if pick.status == "started" then
+                pick.action_failed_at = G.GetTime()
                 G.print("[Wilson P0] pick failed detail id=" .. pick.id
                     .. " reason=" .. G.tostring(action.reason)
                     .. " distance=" .. G.tostring(target:IsValid()
@@ -965,10 +993,40 @@ AddPlayerPostInit(function(inst)
         end)
 
         SetPickStatus(pick, "started")
+        pick.behavior_started_at = G.GetTime()
         SayIntent(command, "我去采些资源")
-        PushApproachedAction(pick, target, action, nil, function()
-            SetPickStatus(pick, "failed_approach")
-        end)
+        if command.native_probe == true then
+            local valid, reason = action:IsValid()
+            G.print("[Wilson native] before id=" .. pick.id
+                .. " t=" .. G.tostring(G.GetTime())
+                .. " valid=" .. G.tostring(valid)
+                .. " reason=" .. G.tostring(reason)
+                .. " target_valid=" .. G.tostring(target:IsValid())
+                .. " distance=" .. G.tostring(G.math.sqrt(inst:GetDistanceSqToInst(target)))
+                .. " dest=" .. G.tostring(locomotor.dest)
+                .. " loco_action=" .. G.tostring(locomotor.bufferedaction)
+                .. " inst_action=" .. G.tostring(inst:GetBufferedAction())
+                .. " client_preview=none")
+            pick.native_action_started_at = G.GetTime()
+            local ok, result = G.pcall(locomotor.PushAction, locomotor, action, false)
+            G.print("[Wilson native] after id=" .. pick.id
+                .. " t=" .. G.tostring(G.GetTime())
+                .. " pcall=" .. G.tostring(ok)
+                .. " result=" .. G.tostring(result)
+                .. " dest=" .. G.tostring(locomotor.dest)
+                .. " loco_action=" .. G.tostring(locomotor.bufferedaction)
+                .. " inst_action=" .. G.tostring(inst:GetBufferedAction()))
+            if not ok or (locomotor.dest == nil
+                and locomotor.bufferedaction ~= action
+                and inst:GetBufferedAction() ~= action) then
+                pick.failure_reason = "native_push_rejected:" .. G.tostring(result)
+                SetPickStatus(pick, "failed_native_start")
+            end
+        else
+            PushApproachedAction(pick, target, action, nil, function()
+                SetPickStatus(pick, "failed_approach")
+            end)
+        end
         inst:DoTaskInTime(auto_pick and 10 or 6, function()
             if inst:IsValid() and active_pick == pick and pick.status == "started" then
                 StopPickMotion(pick)
@@ -990,6 +1048,9 @@ AddPlayerPostInit(function(inst)
             type = "PICKUP_TARGET",
             target_guid = command.target_guid,
             status = "received",
+            server_received_at = G.GetTime(),
+            chosen_at = command.chosen_at,
+            command_sent_at = command.command_sent_at,
         }
         active_pick = pickup
         local target = G.Ents[command.target_guid]
@@ -1014,15 +1075,18 @@ AddPlayerPostInit(function(inst)
         local action = G.BufferedAction(inst, target, G.ACTIONS.PICKUP)
         pickup.action = action
         action:AddSuccessAction(function()
+            pickup.action_success_at = G.GetTime()
             pickup.inventory_delta = CountInventoryItem(inst, command.target_prefab) - before
             SetPickStatus(pickup, pickup.inventory_delta > 0 and "completed" or "uncertain")
         end)
         action:AddFailAction(function()
             if pickup.status == "started" then
+                pickup.action_failed_at = G.GetTime()
                 SetPickStatus(pickup, "failed_or_interrupted")
             end
         end)
         SetPickStatus(pickup, "started")
+        pickup.behavior_started_at = G.GetTime()
         SayIntent(command, "我去捡些资源")
         PushApproachedAction(pickup, target, action, nil, function()
             SetPickStatus(pickup, "failed_approach")
@@ -1181,6 +1245,9 @@ AddPlayerPostInit(function(inst)
             type = "FELL_TREE",
             target_guid = command.target_guid,
             status = "received",
+            server_received_at = G.GetTime(),
+            chosen_at = command.chosen_at,
+            command_sent_at = command.command_sent_at,
         }
         active_pick = chop
         local target = G.Ents[command.target_guid]
@@ -1239,6 +1306,13 @@ AddPlayerPostInit(function(inst)
                 if active_pick ~= chop or chop.status ~= "started" then
                     return
                 end
+                local callback_at = G.GetTime()
+                G.print("[Wilson chop] id=" .. chop.id
+                    .. " success_at=" .. G.tostring(callback_at)
+                    .. " since_push=" .. G.tostring(callback_at
+                        - (chop.native_action_started_at or callback_at)))
+                chop.action_success_at = callback_at
+                chop.previous_chop_success_at = callback_at
                 local after_workable = target:IsValid() and target.components.workable or nil
                 local after = after_workable ~= nil
                     and after_workable:GetWorkAction() == G.ACTIONS.CHOP
@@ -1255,6 +1329,7 @@ AddPlayerPostInit(function(inst)
             end)
             action:AddFailAction(function()
                 if chop.status == "started" then
+                    chop.action_failed_at = G.GetTime()
                     SetPickStatus(chop, "failed_or_interrupted")
                 end
             end)
@@ -1263,6 +1338,7 @@ AddPlayerPostInit(function(inst)
             end)
         end
         SetPickStatus(chop, "started")
+        chop.behavior_started_at = G.GetTime()
         SayIntent(command, "我来砍倒这棵树")
         push_next_chop()
         inst:DoTaskInTime(30, function()
@@ -1278,6 +1354,74 @@ AddPlayerPostInit(function(inst)
             ReadVisibleHazards(inst, HAZARD_OBSERVE_RADIUS)
         local locomotor = inst.components.locomotor
         local inventory = inst.components.inventory
+        local px, _, pz = inst.Transform:GetWorldPosition()
+        local on_marsh = G.TheWorld.Map:GetTileAtPoint(px, 0, pz)
+            == G.WORLD_TILES.MARSH
+        if not on_marsh then
+            last_safe_non_marsh_position = {x = px, z = pz}
+        elseif G.TheWorld.state.cycles < 2 and locomotor ~= nil
+            and not inst:HasTag("playerghost")
+            and (active_move == nil or active_move.epoch ~= "local"
+                or active_move.status ~= "started")
+            and (last_local_marsh_at == nil
+                or G.GetTime() - last_local_marsh_at >= 2) then
+            local safe = last_safe_non_marsh_position
+            if safe == nil then
+                for _, point in G.ipairs(ReadFrontier(px, pz)) do
+                    if point.passable and point.endpoint_marsh == false
+                        and point.dx * point.dx + point.dz * point.dz <= 36 then
+                        safe = {x = px + point.dx, z = pz + point.dz}
+                        break
+                    end
+                end
+            end
+            if safe ~= nil then
+                if active_move ~= nil and active_move.status == "started" then
+                    FinishMove(active_move, "interrupted_marsh")
+                end
+                if active_pick ~= nil and active_pick.status == "started" then
+                    StopPickMotion(active_pick)
+                    SetPickStatus(active_pick, "interrupted_marsh")
+                end
+                if active_utility ~= nil and active_utility.status == "started" then
+                    if inst:GetBufferedAction() == active_utility.action then
+                        inst:ClearBufferedAction()
+                        locomotor:Clear()
+                        locomotor:Stop()
+                    end
+                    SetUtilityStatus(active_utility, "interrupted_marsh")
+                end
+                local ok = G.pcall(locomotor.GoToPoint, locomotor,
+                    G.Vector3(safe.x, 0, safe.z), nil, false)
+                last_local_marsh_at = G.GetTime()
+                if ok and locomotor.dest ~= nil then
+                    local_move_id = local_move_id + 1
+                    local distance = G.math.sqrt((safe.x - px) ^ 2 + (safe.z - pz) ^ 2)
+                    local move = {
+                        epoch = "local", id = local_move_id, type = "MOVE_TO_POINT",
+                        escape = true, status = "received", owned_dest = locomotor.dest,
+                        track_progress = true, start_x = px, start_z = pz,
+                        goal_x = safe.x, goal_z = safe.z,
+                        initial_distance = G.math.max(0.1, distance),
+                        last_progress_x = px, last_progress_z = pz,
+                        last_progress_at = G.GetTime(), distance_to_goal = distance,
+                        progress = 0,
+                    }
+                    active_move = move
+                    SetMoveStatus(move, "started")
+                    SayIntent({}, "进了沼泽，先退回安全地面")
+                    SendClientMove("move_start", move.epoch, move.id, safe.x, safe.z)
+                    G.print("[Wilson P0] local marsh return to="
+                        .. G.tostring(safe.x) .. "," .. G.tostring(safe.z))
+                    inst:DoTaskInTime(G.math.max(4, distance / 4 + 2), function()
+                        if inst:IsValid() and active_move == move
+                            and move.status == "started" then
+                            FinishMove(move, "timed_out")
+                        end
+                    end)
+                end
+            end
+        end
         local clock = G.TheWorld.net ~= nil and G.TheWorld.net.components.clock or nil
         local night_soon = G.TheWorld.state.phase == "dusk" and clock ~= nil
             and clock:GetTimeUntilPhase("night") <= 2
@@ -1329,12 +1473,6 @@ AddPlayerPostInit(function(inst)
                 and locomotor.dest == active_move.owned_dest then
                 FinishMove(active_move, "interrupted_threat")
                 SayIntent({}, "附近有危险，我先停下")
-            elseif active_move ~= nil and active_move.status == "arrived"
-                and active_move.goal == "explore"
-                and active_move.owned_dest ~= nil
-                and locomotor.dest == active_move.owned_dest then
-                locomotor:Stop()
-                SendClientMove("move_stop", active_move.epoch, active_move.id)
             elseif active_pick ~= nil and active_pick.status == "started"
                 and (inst:GetBufferedAction() == active_pick.action
                     or active_pick.approaching
@@ -1363,8 +1501,9 @@ AddPlayerPostInit(function(inst)
             move.distance_to_goal = G.math.sqrt(remaining_sq)
             move.progress = G.math.max(0, G.math.min(1,
                 1 - move.distance_to_goal / move.initial_distance))
-            if remaining_sq <= (move.type == "MOVE_TO_TARGET" and 0.25
-                or move.goal == "explore" and 16 or 4) then
+            if remaining_sq <= 0.25
+                or (locomotor ~= nil and locomotor.dest == nil
+                    and remaining_sq <= (move.type == "MOVE_TO_TARGET" and 0.25 or 4)) then
                 FinishMove(move, "arrived")
             elseif locomotor ~= nil and locomotor.dest ~= nil
                 and locomotor.dest ~= move.owned_dest then
@@ -1393,7 +1532,9 @@ AddPlayerPostInit(function(inst)
             local best_point = nil
             local best_distance_sq = nearest_threat.distance_sq + 4
             for _, point in G.ipairs(ReadFrontier(x, z)) do
-                if point.passable and point.dx * point.dx + point.dz * point.dz <= 64 then
+                if point.passable and point.dx * point.dx + point.dz * point.dz <= 64
+                    and (G.TheWorld.state.cycles >= 2
+                        or (point.marsh_steps == 0 and not point.endpoint_marsh)) then
                     local away_distance_sq = (point.dx - nearest_threat.dx) ^ 2
                         + (point.dz - nearest_threat.dz) ^ 2
                     if away_distance_sq > best_distance_sq then
@@ -1457,7 +1598,7 @@ AddPlayerPostInit(function(inst)
             local nearby, nearby_truncated = ReadLocalEntities(inst, x, z)
         local body = G.json.encode({
             probe = "wilson-p0",
-            mod_version = "0.25.0",
+            mod_version = "0.25.1",
             seq = request_seq,
             prefab = inst.prefab,
             guid = inst.GUID,
@@ -1496,6 +1637,16 @@ AddPlayerPostInit(function(inst)
                 inventory_delta = active_pick.inventory_delta,
                 picked_count = active_pick.picked_count,
                 cluster_end_reason = active_pick.cluster_end_reason,
+                failure_reason = active_pick.failure_reason,
+                server_received_at = active_pick.server_received_at,
+                behavior_started_at = active_pick.behavior_started_at,
+                approach_started_at = active_pick.approach_started_at,
+                native_action_started_at = active_pick.native_action_started_at,
+                action_success_at = active_pick.action_success_at,
+                action_failed_at = active_pick.action_failed_at,
+                terminal_at = active_pick.terminal_at,
+                chosen_at = active_pick.chosen_at,
+                command_sent_at = active_pick.command_sent_at,
                 work_delta = active_pick.work_delta,
                 tree_felled = active_pick.tree_felled,
             } or nil,
@@ -1509,6 +1660,11 @@ AddPlayerPostInit(function(inst)
                 delta_z = active_move.delta_z,
                 progress = active_move.progress,
                 distance_to_goal = active_move.distance_to_goal,
+                chosen_at = active_move.chosen_at,
+                command_sent_at = active_move.command_sent_at,
+                server_received_at = active_move.server_received_at,
+                behavior_started_at = active_move.behavior_started_at,
+                terminal_at = active_move.terminal_at,
             } or nil,
             utility = active_utility ~= nil and {
                 epoch = active_utility.epoch,
@@ -1602,7 +1758,15 @@ AddPlayerPostInit(function(inst)
                         local threat_end_distance_sq = nearest_threat ~= nil and
                             (goal_x - px - nearest_threat.dx) ^ 2
                             + (goal_z - pz - nearest_threat.dz) ^ 2 or nil
-                        if is_point and (point_distance_sq > 1600
+                        local _, route_marsh_steps = ReadRouteTerrain(px, pz,
+                            goal_x - px, goal_z - pz)
+                        local early_marsh_route = G.TheWorld.state.cycles < 2
+                            and G.TheWorld.Map:GetTileAtPoint(px, 0, pz)
+                                ~= G.WORLD_TILES.MARSH
+                            and route_marsh_steps > 0
+                        if early_marsh_route then
+                            status = "rejected_marsh_route"
+                        elseif is_point and (point_distance_sq > 1600
                             or not G.TheWorld.Map:IsPassableAtPoint(goal_x, 0, goal_z)) then
                             status = "rejected_point"
                         elseif is_escape and nearest_threat ~= nil
@@ -1618,10 +1782,12 @@ AddPlayerPostInit(function(inst)
                                 epoch = command.epoch,
                                 id = command.id,
                                 type = command.type,
-                                goal = command.goal,
                                 target_guid = is_target and target.GUID or nil,
                                 escape = is_escape,
                                 status = "received",
+                                chosen_at = command.chosen_at,
+                                command_sent_at = command.command_sent_at,
+                                server_received_at = G.GetTime(),
                                 owned_dest = locomotor.dest,
                                 track_progress = is_target or is_point,
                                 start_x = px,

@@ -11,7 +11,7 @@ from survival import SurvivalPlanner
 
 lock = threading.Lock()
 bridge_epoch = uuid.uuid4().hex
-MOD_VERSION = "0.25.0"
+MOD_VERSION = "0.25.1"
 autostart_guids = set()
 last_guid = None
 last_seq = None
@@ -32,6 +32,33 @@ auto_failed = 0
 auto_avoid_until = {}
 auto_reason = "off"
 survival = SurvivalPlanner()
+native_benchmark = {"enabled": False, "guid": None, "running_id": None,
+                    "target_guid": None, "attempts": [], "avoid": {},
+                    "reason": "off"}
+
+
+def native_benchmark_status():
+    return {key: value for key, value in native_benchmark.items() if key != "avoid"}
+
+
+def select_native_benchmark_target(observation):
+    if observation.get("phase") != "day":
+        return None, "waiting_for_day"
+    if observation.get("visible_threat_within_8") is not False:
+        return None, "threat_nearby"
+    health = ((observation.get("vitals") or {}).get("health") or {}).get("current")
+    hunger = ((observation.get("vitals") or {}).get("hunger") or {}).get("current")
+    if not isinstance(health, (int, float)) or health < 75 or not isinstance(hunger, (int, float)) or hunger < 75:
+        return None, "low_vitals"
+    if (observation.get("inventory") or {}).get("free_slots", 0) <= 0:
+        return None, "inventory_full"
+    now = time.monotonic()
+    target = next((entity for entity in observation.get("local_entities") or []
+                   if entity.get("prefab") == "grass" and entity.get("ready") is True
+                   and 64 <= entity.get("dx", 99) ** 2 + entity.get("dz", 99) ** 2 <= 144
+                   and entity.get("marsh_steps", 0) == 0
+                   and native_benchmark["avoid"].get(entity.get("guid"), 0) <= now), None)
+    return (target, "target_found") if target is not None else (None, "waiting_for_grass_8_to_12")
 
 
 def auto_status():
@@ -84,6 +111,11 @@ class ProbeHandler(BaseHTTPRequestHandler):
                 status = auto_status()
             self.send_json(status)
             return
+        if self.path == "/native-benchmark/status":
+            with lock:
+                status = native_benchmark_status()
+            self.send_json(status)
+            return
         if self.path != "/latest":
             self.send_error(404)
             return
@@ -101,13 +133,40 @@ class ProbeHandler(BaseHTTPRequestHandler):
         global auto_enabled, auto_guid, auto_action_id, auto_target_guid
         global auto_completed, auto_failed, auto_reason
 
+        if self.path == "/native-benchmark/start":
+            with lock:
+                observation = latest_observation or {}
+                if (last_guid is None or last_seen_at is None
+                        or time.monotonic() - last_seen_at > 5
+                        or pending_command is not None or survival.enabled or auto_enabled
+                        or any((observation.get(name) or {}).get("status") == "started"
+                               for name in ("execution", "movement", "utility"))):
+                    self.send_error(409, "stop survival and wait for idle Wilson")
+                    return
+                native_benchmark.update(enabled=True, guid=last_guid, running_id=None,
+                                        target_guid=None, attempts=[], avoid={},
+                                        reason="waiting_for_target")
+                autostart_guids.add(last_guid)
+                status = native_benchmark_status()
+            self.send_json(status)
+            print(f"native benchmark started guid={last_guid}", flush=True)
+            return
+
+        if self.path == "/native-benchmark/stop":
+            with lock:
+                native_benchmark["enabled"] = False
+                native_benchmark["reason"] = "stopped"
+                status = native_benchmark_status()
+            self.send_json(status)
+            return
+
         if self.path == "/survival/start":
             with lock:
                 if (last_guid is None or last_seen_at is None
                         or time.monotonic() - last_seen_at > 5):
                     self.send_error(409, "no recent Wilson observation")
                     return
-                if auto_enabled or pending_command is not None or survival.enabled:
+                if auto_enabled or native_benchmark["enabled"] or pending_command is not None or survival.enabled:
                     self.send_error(409, "another mode or command is running")
                     return
                 observation = latest_observation or {}
@@ -153,7 +212,8 @@ class ProbeHandler(BaseHTTPRequestHandler):
                 if last_guid is None or last_seen_at is None or time.monotonic() - last_seen_at > 5:
                     self.send_error(409, "no recent Wilson observation")
                     return
-                if pending_command is not None or auto_action_id is not None or survival.enabled:
+                if (pending_command is not None or auto_action_id is not None
+                        or survival.enabled or native_benchmark["enabled"]):
                     self.send_error(409, "action already pending")
                     return
                 observation = latest_observation or {}
@@ -204,11 +264,13 @@ class ProbeHandler(BaseHTTPRequestHandler):
             print(f"armed STOP id={armed_command['id']} target_id={armed_command['target_id']}", flush=True)
             return
 
-        if self.path in ("/arm-move", "/arm-move-long", "/arm-move-target", "/arm-pick"):
+        if self.path in ("/arm-move", "/arm-move-long", "/arm-move-target",
+                         "/arm-pick", "/arm-native-pick"):
             with lock:
                 if (last_guid is None or last_seen_at is None
                         or time.monotonic() - last_seen_at > 5
-                        or pending_command is not None or survival.enabled):
+                        or pending_command is not None or survival.enabled
+                        or native_benchmark["enabled"]):
                     self.send_error(409)
                     return
                 observation = latest_observation or {}
@@ -233,18 +295,21 @@ class ProbeHandler(BaseHTTPRequestHandler):
                     if target is None:
                         self.send_error(409, "no ready target between 3 and 8 units")
                         return
-                if self.path == "/arm-pick":
+                if self.path in ("/arm-pick", "/arm-native-pick"):
                     nearby = observation.get("local_entities") or []
                     frogs = (entity for entity in nearby if entity.get("prefab") == "frog")
                     if any(entity["dx"] ** 2 + entity["dz"] ** 2 <= 36 for entity in frogs):
                         self.send_error(409, "frog nearby")
                         return
                     target = next((entity for entity in nearby
-                                   if entity.get("prefab") in HARVEST_PREFABS
+                                   if entity.get("prefab") in ({"grass"} if self.path == "/arm-native-pick"
+                                                                else HARVEST_PREFABS)
                                    and entity.get("ready") is True
-                                   and entity["dx"] ** 2 + entity["dz"] ** 2 <= 9), None)
+                                   and ((64 <= entity["dx"] ** 2 + entity["dz"] ** 2 <= 144)
+                                        if self.path == "/arm-native-pick" else
+                                        entity["dx"] ** 2 + entity["dz"] ** 2 <= 9)), None)
                     if target is None:
-                        self.send_error(409, "no ready harvest target within 3 units")
+                        self.send_error(409, "no ready grass at required distance")
                         return
                 next_command_id += 1
                 last_action_id = next_command_id
@@ -260,6 +325,9 @@ class ProbeHandler(BaseHTTPRequestHandler):
                 if target is not None:
                     pending_command["target_guid"] = target["guid"]
                     pending_command["target_prefab"] = target["prefab"]
+                if self.path == "/arm-native-pick":
+                    pending_command["native_probe"] = True
+                    pending_command["auto"] = True
                 pending_deadline = time.monotonic() + 5
                 armed_command = pending_command.copy()
                 response_data = {"armed": armed_command}
@@ -290,7 +358,11 @@ class ProbeHandler(BaseHTTPRequestHandler):
                            and last_seq > 3 and message["seq"] <= 3)
             if new_session:
                 autostart_guids.discard(new_guid)
+                native_benchmark["enabled"] = False
+                native_benchmark["reason"] = "new_session"
             if last_guid != new_guid:
+                native_benchmark["enabled"] = False
+                native_benchmark["reason"] = "player_changed"
                 last_action_id = None
                 if pending_command is not None and pending_command["guid"] != new_guid:
                     pending_command = None
@@ -313,6 +385,18 @@ class ProbeHandler(BaseHTTPRequestHandler):
             if pending_command is not None and time.monotonic() > pending_deadline:
                 print(f"command id={pending_command['id']} expired", flush=True)
                 survival.command_expired(pending_command["id"])
+                if pending_command["id"] == native_benchmark["running_id"]:
+                    native_benchmark["attempts"].append({
+                        "id": native_benchmark["running_id"],
+                        "target_guid": native_benchmark["target_guid"],
+                        "status": "command_expired",
+                    })
+                    native_benchmark["avoid"][native_benchmark["target_guid"]] = time.monotonic() + 30
+                    native_benchmark["running_id"] = None
+                    native_benchmark["target_guid"] = None
+                    if len(native_benchmark["attempts"]) >= 10:
+                        native_benchmark["enabled"] = False
+                        native_benchmark["reason"] = "completed_10_trials"
                 if pending_command["id"] == auto_action_id:
                     auto_failed += 1
                     auto_avoid_until[auto_target_guid] = time.monotonic() + 20
@@ -328,6 +412,48 @@ class ProbeHandler(BaseHTTPRequestHandler):
                     pending_command = None
                     pending_deadline = None
             execution = message.get("execution") or {}
+            if (native_benchmark["running_id"] is not None
+                    and execution.get("epoch") == bridge_epoch
+                    and execution.get("id") == native_benchmark["running_id"]
+                    and execution.get("status") not in (None, "received", "started")):
+                native_benchmark["attempts"].append({
+                    "id": native_benchmark["running_id"],
+                    "target_guid": native_benchmark["target_guid"],
+                    "status": execution.get("status"),
+                    "inventory_delta": execution.get("inventory_delta"),
+                    "failure_reason": execution.get("failure_reason"),
+                    "server_received_at": execution.get("server_received_at"),
+                    "native_action_started_at": execution.get("native_action_started_at"),
+                    "action_success_at": execution.get("action_success_at"),
+                    "action_failed_at": execution.get("action_failed_at"),
+                    "terminal_at": execution.get("terminal_at"),
+                })
+                native_benchmark["avoid"][native_benchmark["target_guid"]] = time.monotonic() + 30
+                print(f"native benchmark trial={len(native_benchmark['attempts'])} "
+                      f"id={native_benchmark['running_id']} status={execution.get('status')} "
+                      f"delta={execution.get('inventory_delta')}", flush=True)
+                native_benchmark["running_id"] = None
+                native_benchmark["target_guid"] = None
+                if len(native_benchmark["attempts"]) >= 10:
+                    native_benchmark["enabled"] = False
+                    native_benchmark["reason"] = "completed_10_trials"
+            if (native_benchmark["enabled"] and pending_command is None
+                    and native_benchmark["running_id"] is None
+                    and all((message.get(name) or {}).get("status") != "started"
+                            for name in ("execution", "movement", "utility"))):
+                target, native_benchmark["reason"] = select_native_benchmark_target(message)
+                if target is not None:
+                    next_command_id += 1
+                    pending_command = {
+                        "epoch": bridge_epoch, "id": next_command_id,
+                        "type": "PICK_TARGET", "guid": last_guid,
+                        "target_guid": target["guid"], "target_prefab": "grass",
+                        "auto": True, "native_probe": True,
+                    }
+                    pending_deadline = time.monotonic() + 5
+                    native_benchmark["running_id"] = next_command_id
+                    native_benchmark["target_guid"] = target["guid"]
+                    native_benchmark["reason"] = "trial_running"
             if auto_action_id is not None and execution.get("epoch") == bridge_epoch and execution.get("id") == auto_action_id:
                 status = execution.get("status")
                 if status == "completed" and execution.get("inventory_delta", 0) > 0:
@@ -373,6 +499,7 @@ class ProbeHandler(BaseHTTPRequestHandler):
             if (message.get("mod_version") == MOD_VERSION
                     and new_guid not in autostart_guids
                     and not survival.enabled and not auto_enabled
+                    and not native_benchmark["enabled"]
                     and pending_command is None
                     and all((message.get(name) or {}).get("status") != "started"
                             for name in ("execution", "movement", "utility"))):
@@ -396,6 +523,8 @@ class ProbeHandler(BaseHTTPRequestHandler):
                 if choice["type"] != "STOP":
                     last_action_id = next_command_id
                 survival.record_command(next_command_id, choice)
+                command["chosen_at"] = choice.get("chosen_at")
+                command["command_sent_at"] = time.time()
                 print(f"survival armed id={next_command_id} type={choice['type']} goal={choice['goal']}", flush=True)
             for event in survival.events:
                 print(event, flush=True)

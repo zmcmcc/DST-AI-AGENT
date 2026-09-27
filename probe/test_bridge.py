@@ -32,6 +32,8 @@ class BridgeSurvivalTests(unittest.TestCase):
         bridge.pending_deadline = None
         bridge.latest_observation = None
         bridge.auto_enabled = False
+        bridge.native_benchmark.update(enabled=False, guid=None, running_id=None,
+                                       target_guid=None, attempts=[], avoid={}, reason="off")
         bridge.survival = bridge.SurvivalPlanner()
         bridge.autostart_guids.clear()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.ProbeHandler)
@@ -107,6 +109,26 @@ class BridgeSurvivalTests(unittest.TestCase):
                     **observation(seq=1)}
         self.request("/probe", reopened)
         self.assertTrue(bridge.survival.enabled)
+
+    def test_native_benchmark_arms_distant_grass_and_records_terminal(self):
+        grass = {"guid": 501, "prefab": "grass", "kind": "harvest",
+                 "ready": True, "dx": 9, "dz": 0, "marsh_steps": 0}
+        inventory = {"counts": {}, "free_slots": 10, "hand": None}
+        self.request("/probe", {"probe": "wilson-p0", **observation(seq=1,
+            local_entities=[grass], inventory=inventory)})
+        self.assertTrue(self.request("/native-benchmark/start")["enabled"])
+        command = self.request("/probe", {"probe": "wilson-p0", **observation(
+            seq=2, local_entities=[grass], inventory=inventory)})["command"]
+        self.assertEqual(command["type"], "PICK_TARGET")
+        self.assertTrue(command["native_probe"])
+        self.assertEqual(command["target_guid"], 501)
+        self.request("/probe", {"probe": "wilson-p0", **observation(seq=3,
+            inventory=inventory, local_entities=[],
+            execution={"epoch": command["epoch"], "id": command["id"],
+                       "status": "completed", "inventory_delta": 1,
+                       "native_action_started_at": 3.0, "terminal_at": 5.0})})
+        self.assertEqual(bridge.native_benchmark["attempts"][0]["status"], "completed")
+        self.assertEqual(bridge.native_benchmark["attempts"][0]["terminal_at"], 5.0)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import unittest
+import time
 
 from survival import SurvivalPlanner
 
@@ -435,6 +436,29 @@ class SurvivalPlannerTests(unittest.TestCase):
         planner.start(state)
         choice = planner.on_observation(state, "epoch")
         self.assertEqual((choice["x"], choice["z"]), (0, 18))
+
+    def test_first_two_days_never_fall_back_to_marsh_frontier(self):
+        planner = SurvivalPlanner()
+        state = observation(cycles=0, frontier=[
+            {"dx": 18, "dz": 0, "passable": True, "marsh_steps": 2,
+             "endpoint_marsh": True}])
+        planner.start(state)
+        self.assertIsNone(planner.on_observation(state, "epoch"))
+        self.assertEqual(planner.reason, "no_safe_frontier")
+
+    def test_safety_episode_waits_for_stable_recovery(self):
+        planner = SurvivalPlanner()
+        planner.start(observation())
+        danger = observation(visible_threat_within_8=True,
+            nearest_threat={"prefab": "frog", "dx": 3, "dz": 0})
+        planner._remember(danger)
+        self.assertEqual(planner.safety_mode, "EVADE")
+        planner._remember(observation())
+        self.assertEqual(planner.safety_mode, "RECOVER")
+        self.assertIsNone(planner._choose(observation()))
+        planner.safety_clear_since = time.monotonic() - 3
+        planner._remember(observation())
+        self.assertEqual(planner.safety_mode, "NORMAL")
 
     def test_escape_uses_long_leg_and_remembers_danger(self):
         planner = SurvivalPlanner()

@@ -96,6 +96,10 @@ class SurvivalPlanner:
         self.behavior_seq = 0
         self.collect_area = None
         self.action_behavior_id = None
+        self.safety_mode = "NORMAL"
+        self.safety_clear_since = None
+        self.last_health = None
+        self.recent_hit_until = 0
 
     def status(self):
         return {
@@ -103,6 +107,7 @@ class SurvivalPlanner:
             "guid": self.guid,
             "goal": self.goal,
             "reason": self.reason,
+            "safety_mode": self.safety_mode,
             "action_id": self.action_id,
             "action_type": self.action_type,
             "behavior_id": self.action_behavior_id or (self.collect_area or {}).get("id"),
@@ -143,6 +148,7 @@ class SurvivalPlanner:
         if choice["type"] == "STOP":
             self.stop_requested = True
             return
+        choice.setdefault("chosen_at", time.time())
         self.action_id = command_id
         self.action_type = choice["type"]
         self.action_target = choice.get("target_guid")
@@ -278,7 +284,6 @@ class SurvivalPlanner:
                                 and self.avoid_targets.get(target.get("guid"), 0) <= time.monotonic()
                                 and not self._route_near_hazard(observation, target)
                                 and (observation.get("cycles", 0) >= 2
-                                     or observation.get("on_marsh") is True
                                      or target.get("marsh_steps", 0) == 0)):
                             self.reason = "passing_loot"
                             return {"type": "STOP", "target_id": self.action_id,
@@ -449,7 +454,48 @@ class SurvivalPlanner:
             cell = self._cell(x, z)
             self.visits[cell] = self.visits.get(cell, 0) + amount
 
+    def _update_safety_mode(self, observation):
+        now = time.monotonic()
+        health = ((observation.get("vitals") or {}).get("health") or {}).get("current")
+        if isinstance(health, (int, float)):
+            if self.last_health is not None and health < self.last_health:
+                self.recent_hit_until = now + 2
+            self.last_health = health
+        hazards = observation.get("visible_hazards") or []
+        threat = (observation.get("visible_threat_within_8") is True
+                  or any(item.get("targeting_player") is True for item in hazards)
+                  or now < self.recent_hit_until)
+        if threat:
+            if self.safety_mode != "EVADE":
+                self.events.append(f"safety {self.safety_mode}->EVADE")
+            self.safety_mode = "EVADE"
+            self.safety_clear_since = None
+            return
+        if observation.get("on_marsh") is True and observation.get("cycles", 0) < 2:
+            if self.safety_mode == "NORMAL":
+                self.events.append("safety NORMAL->RECOVER marsh")
+            self.safety_mode = "RECOVER"
+            self.safety_clear_since = None
+            return
+        if self.safety_mode == "EVADE":
+            self.safety_mode = "RECOVER"
+            self.safety_clear_since = now
+            self.events.append("safety EVADE->RECOVER")
+        if self.safety_mode == "RECOVER":
+            safely_clear = observation.get("on_marsh") is not True and all(
+                item.get("distance_sq", 0) >= (self._hazard_radius(item.get("prefab")) + 2) ** 2
+                for item in hazards)
+            if not safely_clear:
+                self.safety_clear_since = None
+            elif self.safety_clear_since is None:
+                self.safety_clear_since = now
+            elif now - self.safety_clear_since >= 2:
+                self.safety_mode = "NORMAL"
+                self.safety_clear_since = None
+                self.events.append("safety RECOVER->NORMAL")
+
     def _remember(self, observation):
+        self._update_safety_mode(observation)
         x, z = observation.get("x"), observation.get("z")
         if not isinstance(x, (int, float)) or not isinstance(z, (int, float)):
             return
@@ -514,8 +560,15 @@ class SurvivalPlanner:
                                f"dark={self.night_dark_samples}")
 
     def _choose(self, observation):
-        if observation.get("visible_threat_within_8") is True:
+        if observation.get("on_marsh") is True and observation.get("cycles", 0) < 2:
+            exit_choice = self._leave_marsh(observation)
+            if exit_choice is not None:
+                return exit_choice
+        if self.safety_mode == "EVADE":
             return self._escape(observation)
+        if self.safety_mode == "RECOVER":
+            self.reason = "recovering_from_threat"
+            return None
         if observation.get("visible_threat_within_8") is not False:
             self.reason = "threat_unknown"
             return None
@@ -748,7 +801,6 @@ class SurvivalPlanner:
                 rejected.append(f"{label}=UNSAFE_HAZARD_ROUTE")
                 continue
             if (observation.get("cycles", 0) < 2
-                    and observation.get("on_marsh") is not True
                     and target.get("marsh_steps", 0) > 0):
                 rejected.append(f"{label}=MARSH_ROUTE")
                 continue
@@ -858,10 +910,11 @@ class SurvivalPlanner:
             self.reason = "position_unknown"
             return None
         choices = []
-        marsh_choices = []
         for index, point in enumerate(frontier):
             dx, dz = point.get("dx"), point.get("dz")
             if point.get("passable") is not True or not isinstance(dx, (int, float)) or not isinstance(dz, (int, float)):
+                continue
+            if observation.get("cycles", 0) < 2 and point.get("marsh_steps", 0) > 0:
                 continue
             if self._route_near_hazard(observation, point):
                 continue
@@ -889,16 +942,9 @@ class SurvivalPlanner:
             new_cells = len(self._cells_visible_from(*destination) - self.seen_cells)
             marsh_steps = point.get("marsh_steps", 0)
             score = visits * 1.5 - new_cells + turn_cost + marsh_steps * 35
-            row = (score, visits, index, destination, (dx, dz))
-            if (marsh_steps > 0 and observation.get("cycles", 0) < 2
-                    and observation.get("on_marsh") is not True):
-                marsh_choices.append(row)
-            else:
-                choices.append(row)
+            choices.append((score, visits, index, destination, (dx, dz)))
         if not choices:
-            choices = marsh_choices
-        if not choices:
-            self.reason = "no_walkable_frontier"
+            self.reason = "no_safe_frontier"
             return None
         best_score, _, _, destination, heading = min(choices)
         self.decision_seq += 1
@@ -934,7 +980,6 @@ class SurvivalPlanner:
                         if point.get("passable") is True
                         and not self._route_near_hazard(observation, point)
                         and (observation.get("cycles", 0) >= 2
-                             or observation.get("on_marsh") is True
                              or point.get("marsh_steps", 0) == 0)]
             if frontier:
                 waypoint = min(frontier, key=lambda point:
@@ -977,6 +1022,11 @@ class SurvivalPlanner:
                 continue
             distance_sq = px * px + pz * pz
             if distance_sq > 400:
+                continue
+            if observation.get("cycles", 0) < 2 and (
+                    point.get("endpoint_marsh") is True
+                    or (observation.get("on_marsh") is not True
+                        and point.get("marsh_steps", 0) > 0)):
                 continue
             new_distance_sq = (px - dx) ** 2 + (pz - dz) ** 2
             if new_distance_sq <= current_distance_sq + 4:
